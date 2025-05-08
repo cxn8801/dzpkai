@@ -278,6 +278,21 @@ class WebSocketClient:
         body_stream = body.SerializeToString()
         return await self.send_message(header_stream, body_stream)
     
+    async def send_cancel_hold_desk(self, uid) -> bool:
+        # Prepare header
+        header = header_pb2.Header()
+        header.messageName = "csdzpkproto.CSCancelHoldDesk"
+        header.gameId = "dzpk"
+
+        # Prepare body
+        body = dzpk_pb2.CSCancelHoldDesk()
+        body.uid = uid
+
+        # Serialize and send
+        header_stream = header.SerializeToString()
+        body_stream = body.SerializeToString()
+        return await self.send_message(header_stream, body_stream)
+    
     # 跟注
     async def send_call(self) -> bool:
         # Prepare header
@@ -528,10 +543,14 @@ class WebSocketClient:
         pass
 
     async def on_enter_room(self, data):
-        # logger.info('on_enter_room:', data)
+        logger.info('on_enter_room:{}', data)
         if data.roomPlayer.uid == self.my_uid:
             self.my_seat_number = data.roomPlayer.seatNumber
             self.available_chip = data.roomPlayer.takeChip
+
+            if data.roomPlayer.isHoldDesk or data.roomPlayer.isHoldDesked:
+                await self.send_cancel_hold_desk(self.my_uid)
+
         await self.send_room_scene_prepared()
 
     async def on_game_start(self, data):
@@ -739,13 +758,14 @@ async def single_client(player_id):
         await client.connect()
         logger.info("Player {} sending login...", player_id)
         # 设置要进入的房间号密码
-        client.set_room_no_pwd("978876455", "8173")
+        client.set_room_no_pwd("867002091", "9802")
         # 发送登录请求,第一个参数“用户名”，第二个参数“密码”，没有账号账号自动创建
         await client.send_login_msg(f"player{player_id:02d}", "123")
         
         while client._running:
             await asyncio.sleep(1)
     finally:
+        # logger.info("leave--------------------------", player_id)
         await client.disconnect()
 
 async def main():
