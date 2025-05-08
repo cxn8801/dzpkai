@@ -247,8 +247,7 @@ class WebSocketClient:
         return await self.send_message(header_stream, body_stream)
     
     async def send_enter_friend_room(self) -> bool:
-
-        logger.info('send_enter_friend_room----------------------------------------------')
+        # logger.info('send_enter_friend_room----------------------------------------------')
         # Prepare header
         header = header_pb2.Header()
         header.messageName = "csdzpkproto.CSEnterFriendRoom"
@@ -417,7 +416,7 @@ class WebSocketClient:
                 #     'header': header,
                 #     'body_data': body_data
                 # })
-                logger.info('----------------------------------------{}', header.messageName)
+                # logger.info('----------------------------------------{}', header.messageName)
                 
                 if header.messageName == "csproto.SCAuth":
                     body = lobby_pb2.SCAuth()
@@ -610,7 +609,7 @@ class WebSocketClient:
 
 
     async def on_op_list(self, data):
-        logger.info('small blind:{}', self.small_blind)
+        # logger.info('small blind:{}', self.small_blind)
         logger.info('uid:{}, available_chip:{}, pot:{}', self.my_uid, self.available_chip, self.g_pot)
         logger.info("Hand cards: {}, Table cards: {}", self.my_hand_cards, self.table_cards)
         
@@ -653,11 +652,14 @@ class WebSocketClient:
     async def on_look_card(self, data):
         operation = {'uid': data.uid, 'op':Op.Check}
         self.action_done.append(operation)
+        logger.info('on_look_card:{}', operation)
 
     # 有玩家call
     async def on_call(self, data):
         operation = {'uid': data.uid, 'op':Op.Call, 'chip': data.chip}
         self.action_done.append(operation)
+        logger.info('on_call:{}', operation)
+
         if data.uid == self.my_uid:
             self.available_chip -= data.chip
             self.money_on_the_table += data.chip
@@ -671,6 +673,9 @@ class WebSocketClient:
     async def on_belt(self, data):
         operation = {'uid': data.uid, 'op':Op.Belt, 'chip': data.chip}
         self.action_done.append(operation)
+
+        logger.info('on_belt:{}', operation)
+
         if data.uid == self.my_uid:
             self.available_chip -= data.chip
             self.money_on_the_table += data.chip
@@ -685,6 +690,8 @@ class WebSocketClient:
         operation = {'uid': data.uid, 'op':Op.Raise, 'chip': data.chip}
         self.action_done.append(operation)
 
+        logger.info('on_fill:{}', operation)
+
         if data.uid == self.my_uid:
             self.available_chip -= data.chip
             self.money_on_the_table += data.chip
@@ -698,6 +705,8 @@ class WebSocketClient:
     async def on_all_in(self, data):
         operation = {'uid': data.uid, 'op':Op.AllIn, 'chip': data.chip}
         self.action_done.append(operation)
+
+        logger.info('on_all_in:{}', operation)
 
         if data.uid == self.my_uid:
             self.available_chip -= data.chip
@@ -721,6 +730,7 @@ class WebSocketClient:
 
     async def on_diss_card(self, data):
         self.g_player_num -= 1
+        logger.info('on_diss_card:{}', data.uid)
 
     # 断线重连
     async def on_room_snapshot(self, data):
@@ -758,7 +768,7 @@ async def single_client(player_id):
         await client.connect()
         logger.info("Player {} sending login...", player_id)
         # 设置要进入的房间号密码
-        client.set_room_no_pwd("867002091", "9802")
+        client.set_room_no_pwd("724478644", "3650")
         # 发送登录请求,第一个参数“用户名”，第二个参数“密码”，没有账号账号自动创建
         await client.send_login_msg(f"player{player_id:02d}", "123")
         
