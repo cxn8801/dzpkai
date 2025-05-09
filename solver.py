@@ -750,15 +750,141 @@ class HybridPokerAI:
             'raise': float(opp_profile.get('raise', 0.33)),
         }
 
+
+#-----------------------------------------------------------------------------------------------
+
+def get_gto_baseline(self, game_state):
+    street = game_state.get('street', 'preflop')
+    position = game_state.get('position', 'BTN')
+    if street == 'preflop':
+        if position in ['BTN', 'CO']:
+            return {'fold': 0.15, 'call': 0.35, 'raise': 0.5}
+        else:
+            return {'fold': 0.25, 'call': 0.5, 'raise': 0.25}
+    elif street == 'flop':
+        return {'fold': 0.20, 'call': 0.5, 'raise': 0.3}
+    elif street == 'turn':
+        return {'fold': 0.25, 'call': 0.6, 'raise': 0.15}
+    elif street == 'river':
+        return {'fold': 0.3, 'call': 0.6, 'raise': 0.1}
+    else:
+        return {'fold': 0.33, 'call': 0.34, 'raise': 0.33}
+
+def calculate_chip_reward(old_stack, new_stack, pot_contribution):
+    """计算筹码变化的基础奖励"""
+    delta = new_stack - old_stack
+    # 风险调整：投入筹码越多，奖励需考虑风险系数
+    risk_factor = 1 - (pot_contribution / (old_stack + 1e-8))  # 防止除零
+    return delta * risk_factor
+
+def calculate_equity_reward(initial_equity, final_equity, street):
+    """根据胜率变化计算奖励"""
+    equity_gain = final_equity - initial_equity
+    # 阶段权重：越后期胜率变化越重要
+    stage_weights = {'preflop': 0.3, 'flop': 0.5, 'turn': 0.7, 'river': 1.0}
+    return equity_gain * stage_weights.get(street, 0.5)
+
+def evaluate_action_quality(action, game_state, expected_value):
+    """评估动作的合理性（基于GTO基准）"""
+    # 获取GTO推荐动作概率
+    gto_probs = get_gto_baseline(game_state)
+    
+    # 计算动作偏离度
+    action_idx = ACTION_SPACE.index(action)
+    deviation = 1 - gto_probs[action]  # 偏离GTO建议的程度
+    
+    # 价值调整：实际收益与期望值的差异
+    value_diff = (actual_result - expected_value) * 100
+    return value_diff - deviation * 0.5
+
+def calculate_exploitation_bonus(action, opp_profile):
+    """根据对手类型给予额外奖励"""
+    style = opp_profile.get('style', 'balanced')
+    # 针对不同对手风格的奖励调整
+    style_bonus = {
+        'aggressive': {'fold': 0, 'call': -0.2, 'raise': 0.3},
+        'passive':    {'fold': 0.2, 'call': 0, 'raise': -0.1},
+        'tight':      {'fold': -0.3, 'call': 0.1, 'raise': 0.2},
+        'loose':      {'fold': 0.3, 'call': -0.1, 'raise': 0}
+    }.get(style, {})
+    return style_bonus.get(action, 0)
+
+def calculate_reward(game_state, action, new_state, opp_profile):
+    """综合奖励计算"""
+    # 基础奖励
+    chip_reward = calculate_chip_reward(
+        old_stack=game_state['stack'],
+        new_stack=new_state['stack'],
+        pot_contribution=game_state['current_pot']
+    )
+    
+    # 胜率变化奖励
+    equity_reward = calculate_equity_reward(
+        initial_equity=game_state['calculated_equity'],
+        final_equity=new_state['calculated_equity'],
+        street=game_state['street']
+    )
+    
+    # 动作质量评估
+    action_quality = evaluate_action_quality(
+        action=action,
+        game_state=game_state,
+        expected_value=game_state['expected_value']
+    )
+    
+    # 对手剥削奖励
+    exploit_bonus = calculate_exploitation_bonus(action, opp_profile)
+    
+    # 合成总奖励（可调权重）
+    total_reward = (
+        chip_reward * 0.6 +
+        equity_reward * 0.25 +
+        action_quality * 0.1 +
+        exploit_bonus * 0.05
+    )
+    
+    # 终局奖励放大
+    if new_state['game_ended']:
+        total_reward *= 2.5  # 增强最终结果的奖励信号
+    
+    return total_reward
+
 # ====================== 演示主流程 ======================
 if __name__ == "__main__":
+    # 初始化AI
     poker_ai = HybridPokerAI()
-    game_state = simulate_game_state()
-    decision = poker_ai.decide_action(game_state)
-    print("当前牌局状态：")
-    print(f"手牌: {[Card.int_to_str(c) for c in game_state['hero_hand']]}")
-    print(f"公共牌: {[Card.int_to_str(c) for c in game_state['community']]}")
-    print(f"位置: {game_state['position']}")
-    print("\n推荐决策：")
-    for action in decision:
-        print(f"- {action}")
+
+    # 模拟100局游戏进行在线学习
+    for _ in range(100):
+        # 1. 获取游戏状态
+        game_state = simulate_game_state()
+        
+        # 2. AI决策
+        action = poker_ai.decide_action(game_state)
+        
+        # 3. 环境反馈（假设此处模拟游戏结果）
+        game_result = simulate_outcome(game_state, action)
+        reward = calculate_reward(game_result)
+        
+        # 4. 提取特征并存储经验
+        features = poker_ai.extract_features(game_state)
+        experience = (features['context'], action, reward)
+        
+        # 5. 触发在线学习
+        poker_ai.online_learn(experience)
+
+
+
+
+
+
+    # poker_ai = HybridPokerAI()
+    # game_state = simulate_game_state()
+    # decision = poker_ai.decide_action(game_state)
+    # print("当前牌局状态：")
+    # print(f"手牌: {[Card.int_to_str(c) for c in game_state['hero_hand']]}")
+    # print(f"公共牌: {[Card.int_to_str(c) for c in game_state['community']]}")
+    # print(f"位置: {game_state['position']}")
+    # print("\n推荐决策：")
+    # for action in decision:
+    #     print(f"- {action}")
