@@ -344,6 +344,30 @@ class HybridPokerAI:
         dump(self.stage_models['flop'], f'{self.model_path}flop_model.joblib')
         print(f"基础模型已保存至：{os.path.abspath(self.model_path)}")
 
+    def online_learn(self, experience):
+        self.memory.store(experience)
+        batch = self.memory.sample(512)
+        self.online_learner.update(batch)
+        self._update_models()
+
+    def _update_models(self):
+        # 从经验池采样
+        batch = self.memory.sample(512)
+        if not batch:
+            return
+        # 假设经验格式为 (features, label)
+        X, y = zip(*batch)
+        X = np.array(X)
+        y = np.array(y)
+        # 针对每个阶段模型做增量训练（如果支持partial_fit）
+        for stage, model in self.stage_models.items():
+            if hasattr(model, "partial_fit"):
+                classes = np.unique(y)
+                model.partial_fit(X, y, classes=classes)
+            else:
+                # 不支持partial_fit的模型（如XGB/GBDT），可考虑refit或跳过
+                pass
+
     def decide_action(self, game_state):
         raw_features = self.extract_features(game_state)
         context = self.context_model(torch.Tensor(raw_features['context']))
