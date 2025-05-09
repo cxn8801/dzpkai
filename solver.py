@@ -1162,24 +1162,57 @@ class RewardNormalizer:
 # ====================== 演示主流程 ======================
 if __name__ == "__main__":
     # 测试缓存系统
-    poker_ai = HybridPokerAI()
+    # 完整的在线学习循环
+    ai = HybridPokerAI()
+    env = PokerEnvironment()
+
+    for episode in range(10000):
+        state = env.reset()
+        episode_memory = []
+        
+        while not env.done:
+            action = ai.decide_action(state)
+            next_state, reward, done = env.step(action)
+            
+            # 存储经验
+            ai.memory.store((state, action, reward, next_state, done))
+            episode_memory.append((state, action, reward))
+            
+            state = next_state
+        
+        # 计算完整轨迹的TD误差
+        returns = calculate_returns([r for (s,a,r) in episode_memory])
+        
+        # 执行在线学习
+        if len(ai.memory) > 512:
+            batch = ai.memory.sample(512)
+            ai.online_learn(batch)
+        
+        # 定期保存模型
+        if episode % 100 == 0:
+            ai.save_model(f'models/episode_{episode}.pt')
+
+
+
+
+
     
-    # 第一次计算（应触发缓存未命中）
-    state1 = simulate_game_state()
-    poker_ai.update_equity(state1)
-    print("首次计算结果:", state1['calculated_equity'])
-    print("缓存状态:", poker_ai.cache_status)  # 应显示 misses=1
+    # # 第一次计算（应触发缓存未命中）
+    # state1 = simulate_game_state()
+    # poker_ai.update_equity(state1)
+    # print("首次计算结果:", state1['calculated_equity'])
+    # print("缓存状态:", poker_ai.cache_status)  # 应显示 misses=1
     
-    # 相同状态再次计算（应命中缓存）
-    state2 = state1.copy()
-    poker_ai.update_equity(state2)
-    print("缓存命中后结果:", state2['calculated_equity'])
-    print("缓存状态:", poker_ai.cache_status)  # 应显示 hits=1
+    # # 相同状态再次计算（应命中缓存）
+    # state2 = state1.copy()
+    # poker_ai.update_equity(state2)
+    # print("缓存命中后结果:", state2['calculated_equity'])
+    # print("缓存状态:", poker_ai.cache_status)  # 应显示 hits=1
     
-    # 强制重新计算
-    poker_ai.update_equity(state1, force_update=True)
-    print("强制更新后结果:", state1['calculated_equity'])
-    print("缓存状态:", poker_ai.cache_status)  # misses=2
+    # # 强制重新计算
+    # poker_ai.update_equity(state1, force_update=True)
+    # print("强制更新后结果:", state1['calculated_equity'])
+    # print("缓存状态:", poker_ai.cache_status)  # misses=2
 
 
 
@@ -1205,13 +1238,13 @@ if __name__ == "__main__":
 
 
 
-    poker_ai = HybridPokerAI()
-    game_state = simulate_game_state()
-    decision = poker_ai.decide_action(game_state)
-    print("当前牌局状态：")
-    print(f"手牌: {[Card.int_to_str(c) for c in game_state['hero_hand']]}")
-    print(f"公共牌: {[Card.int_to_str(c) for c in game_state['community']]}")
-    print(f"位置: {game_state['position']}")
-    print("\n推荐决策：")
-    for action in decision:
-        print(f"- {action}")
+    # poker_ai = HybridPokerAI()
+    # game_state = simulate_game_state()
+    # decision = poker_ai.decide_action(game_state)
+    # print("当前牌局状态：")
+    # print(f"手牌: {[Card.int_to_str(c) for c in game_state['hero_hand']]}")
+    # print(f"公共牌: {[Card.int_to_str(c) for c in game_state['community']]}")
+    # print(f"位置: {game_state['position']}")
+    # print("\n推荐决策：")
+    # for action in decision:
+    #     print(f"- {action}")
