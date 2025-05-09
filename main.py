@@ -7,6 +7,7 @@ import lobby_pb2
 import dzpk_pb2
 from enum import Enum
 from loguru import logger
+import solver
 
 logger.add("poker.log", rotation="100 MB")  # 自动轮转日志
 
@@ -768,7 +769,7 @@ async def single_client(player_id):
         await client.connect()
         logger.info("Player {} sending login...", player_id)
         # 设置要进入的房间号密码
-        client.set_room_no_pwd("724478644", "3650")
+        client.set_room_no_pwd("212810093", "0989")
         # 发送登录请求,第一个参数“用户名”，第二个参数“密码”，没有账号账号自动创建
         await client.send_login_msg(f"player{player_id:02d}", "123")
         
