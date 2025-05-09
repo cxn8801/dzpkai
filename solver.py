@@ -10,6 +10,7 @@ from sklearn.dummy import DummyClassifier
 from sklearn.cluster import MiniBatchKMeans
 from sklearn.exceptions import NotFittedError
 from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.linear_model import LinearRegression
 import numpy as np
 import torch
 import torch.nn as nn
@@ -20,6 +21,7 @@ from datetime import datetime
 from collections import deque
 import hashlib
 import os
+import json
 
 # ====================== 常量与工具 ======================
 NUM_FEATURES = 15
@@ -33,17 +35,22 @@ def create_card(card_str):
 
 def simulate_game_state():
     """模拟一个典型游戏状态"""
-    return {
-        'hero_hand': [create_card('Ah'), create_card('Kd')],
+    game_state = {
+        'player_id': 5,
+        'hero_hand': [create_card('3h'), create_card('2d')],
         'community': [create_card('Qs'), create_card('Jh'), create_card('Tc')],
         'street': 'flop',
         'position': 'BTN',
         'current_pot': 150,
-        'previous_actions': ['check', 'call'],
-        'player_id': 1,
+        'previous_actions': [
+            {'action': 'raise', 'bet_size': 50},
+            {'action': 'call', 'bet_size': 20}
+        ],
         'stack': 1000,
         'to_call': 20
     }
+
+    return game_state
 
 # ====================== Range与牌力模块 ======================
 class RangeManager:
@@ -166,6 +173,7 @@ class MLPredictor:
         X = np.random.rand(100, 5)
         y = np.random.randint(0, 3, 100)
         self.model.fit(X, y)
+
     def predict(self, features):
         try:
             proba = self.model.predict_proba([features])[0]
@@ -273,12 +281,17 @@ class HybridPokerAI:
         self.model_path = 'models/'
         os.makedirs(self.model_path, exist_ok=True)
         self.decision_history = []
+
+        # 初始化 context_model
+        self.context_model = GlobalContextNet()
+
         self.stage_models = {
             'preflop': XGBClassifier(n_estimators=100),
             'flop': GradientBoostingClassifier(),
             'turn': self._init_pytorch_model('turn'),
             'river': self._init_pytorch_model('river')
         }
+
         required_files = [
             f'{self.model_path}turn_model.pth',
             f'{self.model_path}river_model.pth',
@@ -287,11 +300,129 @@ class HybridPokerAI:
         if not all(os.path.exists(f) for f in required_files):
             print("检测到缺失模型文件，正在初始化基础模型...")
             self._create_initial_models()
-        self.context_model = GlobalContextNet()
+
         self.opponent_model = OpponentProfiler()
         self.memory = ExperienceReplayBuffer(10000)
         self.online_learner = OnlineAdaptor()
         self._load_model_weights()
+
+        self.meta_learner = LinearRegression()
+        self.weight_optimizer = None
+        self.decision_history = []
+        self.history_file = 'decision_history.json'  # 定义历史记录文件路径
+        self._train_meta_learner()
+
+    def _train_meta_learner(self):
+        """训练元学习器"""
+        historical_data = self._load_decision_history()
+        if not historical_data:
+            print("无历史记录，跳过元学习器训练")
+            return
+        
+        X = np.array([d['features'] for d in historical_data])
+        y = np.array([d['weights'] for d in historical_data])
+        self.meta_learner.fit(X, y)
+
+    def _load_decision_history(self):
+        """加载历史决策数据"""
+        if not os.path.exists(self.history_file):
+            print(f"历史文件 {self.history_file} 不存在，返回空历史记录")
+            return []
+        
+        try:
+            with open(self.history_file, 'r') as f:
+                data = json.load(f)
+                print(f"成功加载历史记录，共 {len(data)} 条记录")
+                return data
+        except Exception as e:
+            print(f"加载历史文件失败: {e}")
+            return []
+        
+    def _save_decision_history(self, new_record):
+        """保存新的历史记录"""
+        try:
+            if os.path.exists(self.history_file):
+                with open(self.history_file, 'r') as f:
+                    history = json.load(f)
+            else:
+                history = []
+            
+            history.append(new_record)
+            
+            with open(self.history_file, 'w') as f:
+                json.dump(history, f, indent=4)
+            print("成功保存新决策记录")
+        except Exception as e:
+            print(f"保存历史记录失败: {e}")
+
+    def _adapt_weights(self, game_state):
+        features = self.extract_features(game_state)
+        weights = self.meta_learner.predict([features['context']])[0]
+        return {action: max(0, weight) for action, weight in zip(ACTION_SPACE, weights)}
+    
+    def _blend_strategies(self, ml_probs, game_state, opp_profile):
+        """融合 ML 预测、GTO 策略和对手调整策略"""
+        # 获取 GTO 基线概率
+        gto_probs = self._get_gto_baseline(game_state)
+
+        # 获取对手调整概率
+        opp_adjustment = self._calculate_opponent_adjustment(opp_profile)
+
+        # 默认权重
+        weights = [0.6, 0.3, 0.1]  # 机器学习、GTO、对手调整的权重
+
+        blended = {}
+        for idx, action in enumerate(ACTION_SPACE):
+            blended[action] = (
+                weights[0] * ml_probs[idx] +
+                weights[1] * gto_probs[action] +
+                weights[2] * opp_adjustment[action]
+            )
+        return blended
+    
+    def _get_gto_baseline(self, game_state):
+        """根据 GTO 策略返回动作概率分布"""
+        street = game_state.get('street', 'preflop')
+        position = game_state.get('position', 'BTN')
+
+        # GTO 概率基线
+        if street == 'preflop':
+            if position in ['BTN', 'CO']:
+                return {'fold': 0.15, 'call': 0.35, 'raise': 0.5}
+            else:
+                return {'fold': 0.25, 'call': 0.5, 'raise': 0.25}
+        elif street == 'flop':
+            return {'fold': 0.20, 'call': 0.5, 'raise': 0.3}
+        elif street == 'turn':
+            return {'fold': 0.25, 'call': 0.6, 'raise': 0.15}
+        elif street == 'river':
+            return {'fold': 0.3, 'call': 0.6, 'raise': 0.1}
+        else:
+            return {'fold': 0.33, 'call': 0.34, 'raise': 0.33}
+        
+    def _calculate_opponent_adjustment(self, opp_profile):
+        """根据对手风格返回动作概率分布"""
+        if not isinstance(opp_profile, dict):
+            return {'fold': 0.33, 'call': 0.34, 'raise': 0.33}
+
+        return {
+            'fold': float(opp_profile.get('fold', 0.33)),
+            'call': float(opp_profile.get('call', 0.34)),
+            'raise': float(opp_profile.get('raise', 0.33)),
+        }
+    
+    def format_decision(self, blended_probs, game_state):
+        total = sum(blended_probs.values()) or 1
+        actions = []
+        for action in ACTION_SPACE:
+            prob = blended_probs.get(action, 0.0) / total
+            percent = int(prob * 100)
+            if action in ['raise', 'bet']:
+                size = int(game_state['current_pot'] * 0.6)
+                actions.append(f"{percent}% {action} {size}BB")
+            else:
+                actions.append(f"{percent}% {action}")
+        return actions
 
     def _init_pytorch_model(self, stage):
         model = StageLSTM(
@@ -332,16 +463,22 @@ class HybridPokerAI:
 
     def _create_initial_models(self):
         print("正在生成初始模型文件...")
+        dummy_X = np.random.rand(100, NUM_FEATURES)  # 确保特征数量为 NUM_FEATURES
+        dummy_y = np.random.randint(0, 3, 100)
+
+        # 训练 preflop 模型
+        self.stage_models['preflop'].fit(dummy_X, dummy_y)
+        dump(self.stage_models['preflop'], f'{self.model_path}preflop_model.joblib')
+
+        # 训练 flop 模型
+        self.stage_models['flop'].fit(dummy_X, dummy_y)
+        dump(self.stage_models['flop'], f'{self.model_path}flop_model.joblib')
+
+        # 保存 turn 和 river 的 PyTorch 模型
         turn_model = StageLSTM(32, 64, 3)
         torch.save(turn_model.state_dict(), f'{self.model_path}turn_model.pth')
         river_model = StageLSTM(48, 64, 3)
         torch.save(river_model.state_dict(), f'{self.model_path}river_model.pth')
-        dummy_X = np.random.rand(100, 15)
-        dummy_y = np.random.randint(0, 3, 100)
-        self.stage_models['preflop'].fit(dummy_X, dummy_y)
-        dump(self.stage_models['preflop'], f'{self.model_path}preflop_model.joblib')
-        self.stage_models['flop'].fit(dummy_X, dummy_y)
-        dump(self.stage_models['flop'], f'{self.model_path}flop_model.joblib')
         print(f"基础模型已保存至：{os.path.abspath(self.model_path)}")
 
     def online_learn(self, experience):
@@ -370,44 +507,49 @@ class HybridPokerAI:
 
     def decide_action(self, game_state):
         raw_features = self.extract_features(game_state)
-        context = self.context_model(torch.Tensor(raw_features['context']))
-        opp_profile = self.opponent_model.predict(game_state)
-        stage = game_state['street']
 
+        # 提取阶段特异性特征
+        stage = game_state['street']
         if stage == 'preflop':
             features = self._preprocess_preflop(raw_features)
-            features = np.array(features)
-            if features.shape[0] < NUM_FEATURES:
-                features = np.pad(features, (0, NUM_FEATURES - features.shape[0]), mode='constant')
-            try:
-                probs = self.stage_models[stage].predict_proba([features])[0]
-                probs = np.array(probs).flatten()
-            except NotFittedError:
-                dummy_X = np.random.rand(10, NUM_FEATURES)
-                dummy_y = np.random.randint(0, 3, 10)
-                self.stage_models[stage].fit(dummy_X, dummy_y)
-                probs = self.stage_models[stage].predict_proba([features])[0]
-                probs = np.array(probs).flatten()
         else:
+            context = self.context_model(torch.Tensor(raw_features['context']))
             features = self._preprocess_postflop(raw_features, context)
-            if features.shape[1] < NUM_FEATURES:
-                pad_size = NUM_FEATURES - features.shape[1]
-                features = torch.cat([features, torch.zeros((features.shape[0], pad_size))], dim=1)
-            np_features = features.numpy()
-            if stage in ['turn', 'river']:
-                with torch.no_grad():
-                    logits, _ = self.stage_models[stage](features, torch.tensor([[STAGES.index(stage)]]))
-                    probs = torch.softmax(logits, dim=-1).numpy()
-            else:
-                try:
-                    probs = self.stage_models[stage].predict_proba(np_features)
-                    probs = np.array(probs).flatten()
-                except NotFittedError:
-                    dummy_X = np.random.rand(10, NUM_FEATURES)
-                    dummy_y = np.random.randint(0, 3, 10)
-                    self.stage_models[stage].fit(dummy_X, dummy_y)
-                    probs = self.stage_models[stage].predict_proba(np_features)
-                    probs = np.array(probs).flatten()
+
+        # 确保特征维度符合模型要求
+        features = np.array(features)
+        expected_features = NUM_FEATURES  # 模型期望的特征数量
+        if features.ndim > 2:
+            features = features.squeeze()  # 去掉多余维度
+        if features.shape[0] < expected_features:
+            # 如果特征数量不足，填充 0
+            features = np.pad(features, (0, expected_features - features.shape[0]), mode='constant')
+        elif features.shape[0] > expected_features:
+            # 如果特征数量过多，截断
+            features = features[:expected_features]
+
+        # 修改特征处理部分
+        if stage in ['turn', 'river']:
+            with torch.no_grad():
+                logits, _ = self.stage_models[stage](
+                    torch.tensor(features).unsqueeze(0), 
+                    torch.tensor([[STAGES.index(stage)]])
+                )
+                probs = torch.softmax(logits, dim=-1).numpy()
+        else:
+            # 新增维度修正
+            if features.ndim == 3:
+                features = features.squeeze(0)  # 将三维降为二维
+            elif features.ndim == 1:
+                features = features.reshape(1, -1)  # 确保二维
+                
+            # 添加特征校验
+            if features.shape[1] != NUM_FEATURES:
+                features = features[:, :NUM_FEATURES]  # 截断多余特征
+                
+            probs = self.stage_models[stage].predict_proba(features)[0]  # 移除多余列表包装
+
+        opp_profile = self.opponent_model.predict(game_state)
         final_probs = self._blend_strategies(probs, game_state, opp_profile)
         self._record_decision(game_state, final_probs)
         return self.format_decision(final_probs, game_state)
@@ -436,6 +578,36 @@ class HybridPokerAI:
         }
         self.decision_history.append(record)
 
+    def _extract_bet_statistics(self, previous_actions):
+        """
+        根据历史下注动作提取统计信息。
+
+        参数:
+        - previous_actions: 包含玩家之前动作的列表。例如：
+        [{'action': 'raise', 'bet_size': 50}, {'action': 'call', 'bet_size': 20}]
+
+        返回:
+        - 一个特征列表，例如 [aggressive_ratio, avg_bet, bet_count]
+        """
+        if not previous_actions:
+            # 如果没有历史动作，返回默认值
+            return [0.0, 0.0, 0]
+
+        # 定义激进行为和被动行为
+        aggressive_actions = ['raise', 'bet']
+        bet_sizes = [action.get('bet_size', 0) for action in previous_actions if 'bet_size' in action]
+
+        # 统计数据
+        total_actions = len(previous_actions)
+        aggressive_count = sum(1 for action in previous_actions if action['action'] in aggressive_actions)
+        avg_bet = np.mean(bet_sizes) if bet_sizes else 0.0
+        bet_count = len(bet_sizes)
+
+        # 计算激进行为比例
+        aggressive_ratio = aggressive_count / total_actions if total_actions > 0 else 0.0
+
+        return [aggressive_ratio, avg_bet, bet_count]
+    
     def extract_features(self, game_state):
         equity, _ = EnhancedPokerSimulator().calculate_equity(
             game_state['hero_hand'],
@@ -443,21 +615,35 @@ class HybridPokerAI:
             iterations=200,
             street=game_state['street']
         )
-        return {
-            'context': [
-                equity,
-                len(game_state['community']),
-                game_state['current_pot'] / 100,
-                int(game_state['position'] in ['BTN', 'CO']),
-                len(game_state.get('previous_actions', [])),
-                game_state.get('to_call', 0) / game_state['current_pot'] if game_state['current_pot'] > 0 else 0,
-                game_state.get('stack', 1000) / 1000
-            ],
-            'stage_features': [
-                *self._get_stage_specific_features(game_state),
-            ]
-        }
 
+        # 提取 context 特征
+        context = [
+            equity,
+            len(game_state['community']),
+            game_state['current_pot'] / 100,
+            int(game_state['position'] in ['BTN', 'CO']),
+            len(game_state.get('previous_actions', [])),
+            game_state.get('to_call', 0) / game_state['current_pot'] if game_state['current_pot'] > 0 else 0,
+            game_state.get('stack', 1000) / 1000
+        ]
+
+        # 填充或裁剪 context 特征到固定长度（如 7）
+        context_length = 7
+        if len(context) < context_length:
+            context = context + [0.0] * (context_length - len(context))  # 填充 0
+        elif len(context) > context_length:
+            context = context[:context_length]  # 截断
+
+        stage_features = [
+            *self._get_stage_specific_features(game_state),
+        ]
+
+        # 修改后处理逻辑
+        return {
+            'context': np.array(context).flatten(),  # 确保一维化
+            'stage_features': np.array(stage_features).flatten()
+        }
+    
     def _get_stage_specific_features(self, game_state):
         street = game_state['street']
         if street == 'preflop':
@@ -563,23 +749,6 @@ class HybridPokerAI:
             'call': float(opp_profile.get('call', 0.34)),
             'raise': float(opp_profile.get('raise', 0.33)),
         }
-
-    def _blend_strategies(self, ml_probs, game_state, opp_profile):
-        if isinstance(ml_probs, dict):
-            ml_probs = [ml_probs.get(a, 0.0) for a in ACTION_SPACE]
-        ml_probs = np.array(ml_probs).flatten()
-        if ml_probs.shape[0] != 3:
-            ml_probs = np.pad(ml_probs, (0, 3-ml_probs.shape[0]), mode='constant')[:3]
-        gto_probs = self._get_gto_baseline(game_state)
-        opp_adjustment = self._calculate_opponent_adjustment(opp_profile)
-        blended = {}
-        for idx, action in enumerate(ACTION_SPACE):
-            blended[action] = (
-                0.6 * ml_probs[idx] +
-                0.3 * gto_probs[action] +
-                0.1 * opp_adjustment[action]
-            )
-        return blended
 
 # ====================== 演示主流程 ======================
 if __name__ == "__main__":
