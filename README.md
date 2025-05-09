@@ -10,6 +10,12 @@ pip install loguru
 
 pip install protobuf
 
+pip install treys
+
+pip install joblib
+
+pip install scikit-learn
+
 需要留意我的服务器IP地址，服务器到期我会找更便宜的服务器，我会及时在这里更新
 
 'ws://81.69.249.211:19001'
