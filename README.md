@@ -2,6 +2,8 @@
 提供游戏接口用于开发德州扑克AI，检验AI的实战效果
 
 
+使用方法：https://www.bilibili.com/video/BV1CS5Kz5E6M/?spm_id_from=333.1387.list.card_archive.click
+
 运行脚本前，要先安装下面几个包
 
 pip install websockets
