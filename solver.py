@@ -22,6 +22,8 @@ from collections import deque
 import hashlib
 import os
 import json
+from threading import Lock
+import re
 
 # ====================== 常量与工具 ======================
 NUM_FEATURES = 15
@@ -277,10 +279,11 @@ class OnlineAdaptor:
 
 # ====================== 混合AI主控 ======================
 class HybridPokerAI:
-    def __init__(self):
+    def __init__(self):       
         self.model_path = 'models/'
         os.makedirs(self.model_path, exist_ok=True)
         self.decision_history = []
+        self.reward_normalizer = RewardNormalizer()  # 新增此行
 
         # 初始化 context_model
         self.context_model = GlobalContextNet()
@@ -310,50 +313,92 @@ class HybridPokerAI:
         self.weight_optimizer = None
         self.decision_history = []
         self.history_file = 'decision_history.json'  # 定义历史记录文件路径
+        # self.history_file = os.path.abspath('decision_history.json')  # 使用绝对路径
+        # os.makedirs(os.path.dirname(self.history_file), exist_ok=True)  # 确保目录存在
         self._train_meta_learner()
 
+        # 新增胜率缓存系统
+        self.equity_cache = {}  # 缓存字典 {hash_key: equity}
+        self.cache_hits = 0     # 缓存命中统计
+        self.cache_misses = 0   # 缓存未命中统计
+        self.calc_times = []    # 计算耗时记录
+        
+        # 并发控制（如果使用多线程）
+        self.cache_lock = Lock()
+
     def _train_meta_learner(self):
-        """训练元学习器"""
         historical_data = self._load_decision_history()
         if not historical_data:
-            print("无历史记录，跳过元学习器训练")
+            print("无有效历史记录，跳过元学习器训练")
             return
         
-        X = np.array([d['features'] for d in historical_data])
-        y = np.array([d['weights'] for d in historical_data])
+        # 特征提取兼容处理
+        X = []
+        y = []
+        for d in historical_data:
+            # 处理不同版本数据格式
+            features = d.get('features', [])
+            if isinstance(features, dict):  # 处理新版特征结构
+                features = features.get('context', []) + features.get('stage_features', [])
+            
+            # 确保特征维度正确
+            if len(features) >= NUM_FEATURES:
+                X.append(features[:NUM_FEATURES])  # 截断多余特征
+                weights = d.get('weights', [0.33, 0.34, 0.33])
+                y.append(weights)
+        
+        if len(X) < 10:  # 最小训练样本阈值
+            print(f"有效样本不足 ({len(X)})，跳过训练")
+            return
+        
+        # 转换为numpy数组
+        X = np.array(X)
+        y = np.array(y)
+        
+        # 训练元学习器
         self.meta_learner.fit(X, y)
+        print("元学习器训练完成，特征维度:", X.shape)
 
     def _load_decision_history(self):
-        """加载历史决策数据"""
-        if not os.path.exists(self.history_file):
-            print(f"历史文件 {self.history_file} 不存在，返回空历史记录")
-            return []
-        
-        try:
-            with open(self.history_file, 'r') as f:
-                data = json.load(f)
-                print(f"成功加载历史记录，共 {len(data)} 条记录")
-                return data
-        except Exception as e:
-            print(f"加载历史文件失败: {e}")
-            return []
+        historical_data = []
+        if os.path.exists(self.history_file):
+            try:
+                with open(self.history_file, 'r') as f:
+                    raw_data = json.load(f)
+                    # 过滤无效记录
+                    historical_data = [
+                        d for d in raw_data 
+                        if 'features' in d and 'decision' in d
+                    ]
+                    # 旧数据迁移（兼容旧版本）
+                    for d in raw_data:
+                        if 'feature' in d:  # 处理旧键名
+                            d['features'] = d.pop('feature')
+            except Exception as e:
+                print(f"加载历史文件失败: {e}")
+        return historical_data
         
     def _save_decision_history(self, new_record):
-        """保存新的历史记录"""
         try:
+            history = []
             if os.path.exists(self.history_file):
-                with open(self.history_file, 'r') as f:
+                with open(self.history_file, 'r', encoding='utf-8') as f:
                     history = json.load(f)
-            else:
-                history = []
             
             history.append(new_record)
             
-            with open(self.history_file, 'w') as f:
-                json.dump(history, f, indent=4)
-            print("成功保存新决策记录")
+            with open(self.history_file, 'w', encoding='utf-8') as f:
+                json.dump(
+                    history, 
+                    f, 
+                    indent=2, 
+                    default=lambda o: str(o)  # 处理无法序列化的对象
+                )
+            print(f"成功保存记录到 {self.history_file}")  # 确认保存成功
         except Exception as e:
-            print(f"保存历史记录失败: {e}")
+            print(f"保存失败！错误详情: {str(e)}", file=sys.stderr)  # 输出到标准错误
+            import traceback
+            traceback.print_exc()  # 打印完整堆栈跟踪
 
     def _adapt_weights(self, game_state):
         features = self.extract_features(game_state)
@@ -481,12 +526,6 @@ class HybridPokerAI:
         torch.save(river_model.state_dict(), f'{self.model_path}river_model.pth')
         print(f"基础模型已保存至：{os.path.abspath(self.model_path)}")
 
-    def online_learn(self, experience):
-        self.memory.store(experience)
-        batch = self.memory.sample(512)
-        self.online_learner.update(batch)
-        self._update_models()
-
     def _update_models(self):
         # 从经验池采样
         batch = self.memory.sample(512)
@@ -552,6 +591,8 @@ class HybridPokerAI:
         opp_profile = self.opponent_model.predict(game_state)
         final_probs = self._blend_strategies(probs, game_state, opp_profile)
         self._record_decision(game_state, final_probs)
+        self._record_decision(game_state, final_probs)
+        print("决策记录已生成")  # 调试日志
         return self.format_decision(final_probs, game_state)
 
     def format_decision(self, blended_probs, game_state):
@@ -572,11 +613,16 @@ class HybridPokerAI:
         return features
 
     def _record_decision(self, game_state, final_probs):
+        features = self.extract_features(game_state)
+        
+        # 转换为可序列化类型
         record = {
-            'game_state': game_state.copy(),
-            'decision': final_probs
+            'features': features['context'].tolist() if isinstance(features['context'], np.ndarray) else features['context'],
+            'stage_features': features['stage_features'].tolist() if isinstance(features['stage_features'], np.ndarray) else features['stage_features'],
+            'decision': {k: float(v) for k, v in final_probs.items()},
+            'timestamp': datetime.now().isoformat()
         }
-        self.decision_history.append(record)
+        self._save_decision_history(record)
 
     def _extract_bet_statistics(self, previous_actions):
         """
@@ -749,142 +795,423 @@ class HybridPokerAI:
             'call': float(opp_profile.get('call', 0.34)),
             'raise': float(opp_profile.get('raise', 0.33)),
         }
+    
+    #在线学习部分
+    def online_learn(self, experience_batch):
+        """批量在线学习实现"""
+        # 转换经验格式
+        states, actions, rewards, next_states, dones = zip(*experience_batch)
+        
+        # 转换为模型输入格式
+        X = []
+        y = []
+        for i in range(len(states)):
+            # 提取特征
+            state_features = self.extract_features(states[i])['context']
+            next_features = self.extract_features(next_states[i])['context']
+            
+            # 当前Q值
+            current_q = self._predict_q_value(state_features)
+            
+            # 目标Q值
+            target = rewards[i]
+            if not dones[i]:
+                next_q = self._predict_q_value(next_features)
+                target += self.gamma * np.max(next_q)
+            
+            # 更新动作对应的Q值
+            action_idx = ACTION_SPACE.index(actions[i])
+            current_q[action_idx] = target
+            
+            X.append(state_features)
+            y.append(current_q)
+        
+        # 转换为Tensor
+        X_tensor = torch.FloatTensor(np.array(X))
+        y_tensor = torch.FloatTensor(np.array(y))
+        
+        # 训练神经网络
+        for stage in ['turn', 'river']:
+            self.stage_models[stage].train()
+            optimizer = torch.optim.Adam(self.stage_models[stage].parameters())
+            
+            # 训练循环
+            for _ in range(3):  # 小批量多次更新
+                predictions, _ = self.stage_models[stage](X_tensor)
+                loss = nn.MSELoss()(predictions, y_tensor)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+        
+        # 更新树模型
+        self._update_tree_models(X, y)
+
+    def _execute_action(self, game_state, action):
+        """执行动作并返回新状态"""
+        new_state = game_state.copy()
+        
+        # 解析动作类型
+        action_type, *params = action.split()
+        bet_size = int(params[0]) if params else 0
+        
+        # 更新游戏状态
+        if action_type == 'fold':
+            new_state['active_players'][self.player_id] = False
+        elif action_type == 'call':
+            new_state['current_bet'] = game_state['to_call']
+            new_state['stack'] -= game_state['to_call']
+            new_state['pot'] += game_state['to_call']
+        elif action_type == 'raise':
+            raise_size = max(bet_size, game_state['min_raise'])
+            new_state['current_bet'] += raise_size
+            new_state['stack'] -= raise_size
+            new_state['pot'] += raise_size
+            new_state['min_raise'] = raise_size * 2
+        
+        # 推进游戏阶段
+        if self._should_advance_street(new_state):
+            new_state['street'] = self._next_street(new_state['street'])
+            new_state['current_bet'] = 0
+            new_state['min_raise'] = new_state['big_blind']
+        
+        # 计算新胜率
+        if new_state['street'] != game_state['street']:
+            self.update_equity(new_state)
+        
+        return new_state
+    
+    def _should_advance_street(self, state):
+        """判断是否进入下一阶段"""
+        active_players = sum(state['active_players'])
+        if active_players <= 1:
+            return True
+        bets_equal = all(p['current_bet'] == state['current_bet'] 
+                        for p in state['players'] if p['active'])
+        return bets_equal
+    
+    def _next_street(self, current_street):
+        streets = ['preflop', 'flop', 'turn', 'river']
+        current_index = streets.index(current_street)
+        return streets[current_index + 1] if current_index < 3 else current_street
+    
+    def calculate_chip_reward(self, old_stack, new_stack, pot_contribution):
+        """计算筹码变化的基础奖励"""
+        delta = new_stack - old_stack
+        # 风险调整：投入筹码越多，奖励需考虑风险系数
+        risk_factor = 1 - (pot_contribution / (old_stack + 1e-8))  # 防止除零
+        return delta * risk_factor
+    
+    def calculate_equity_reward(self, initial_equity, final_equity, street):
+        """根据胜率变化计算奖励"""
+        equity_gain = final_equity - initial_equity
+        # 阶段权重：越后期胜率变化越重要
+        stage_weights = {'preflop': 0.3, 'flop': 0.5, 'turn': 0.7, 'river': 1.0}
+        return equity_gain * stage_weights.get(street, 0.5)
+    
+    # 使用蒙特卡洛模拟估算期望价值
+    def estimate_expected_value(self, game_state):
+        simulator = EnhancedPokerSimulator()
+        outcomes = []
+        for _ in range(200):
+            outcome = simulator.simulate_hand_outcome(game_state)
+            outcomes.append(outcome)
+        return np.mean(outcomes)
+    
+    def evaluate_action_quality(self, action, game_state, expected_value, actual_result):
+        """评估动作的合理性（基于GTO基准）"""
+        # 获取GTO推荐动作概率
+        gto_probs = self._get_gto_baseline(game_state)
+        
+        # 计算动作偏离度
+        action_idx = ACTION_SPACE.index(action)
+        deviation = 1 - gto_probs[action]  # 偏离GTO建议的程度
+        
+        # 价值调整：实际收益与期望值的差异
+        value_diff = (actual_result - expected_value) * 100
+        return value_diff - deviation * 0.5
+    
+    def calculate_exploitation_bonus(self, action, opp_profile):
+        """根据对手类型给予额外奖励"""
+        style = opp_profile.get('style', 'balanced')
+        # 针对不同对手风格的奖励调整
+        style_bonus = {
+            'aggressive': {'fold': 0, 'call': -0.2, 'raise': 0.3},
+            'passive':    {'fold': 0.2, 'call': 0, 'raise': -0.1},
+            'tight':      {'fold': -0.3, 'call': 0.1, 'raise': 0.2},
+            'loose':      {'fold': 0.3, 'call': -0.1, 'raise': 0}
+        }.get(style, {})
+        return style_bonus.get(action, 0)
+
+    def calculate_reward(self, old_state, action, new_state):
+        """完整奖励计算实现"""
+        # 计算实际筹码变化
+        actual_result = new_state['stack'] - old_state['stack']
+        
+        # 传递实际结果到评估函数
+        action_quality = self.evaluate_action_quality(
+            action=action,
+            game_state=old_state,
+            expected_value=expected_value,
+            actual_result=actual_result  # ✅ 传递参数
+        )
+
+        # 确保胜率已计算
+        if 'calculated_equity' not in old_state:
+            self.update_equity(old_state)
+        if 'calculated_equity' not in new_state:
+            self.update_equity(new_state)
+
+        # 获取对手画像
+        opp_profile = self.opponent_model.predict(old_state)
+
+        # 计算各奖励分量
+        chip_reward = self.calculate_chip_reward(
+            old_stack=old_state['stack'],
+            new_stack=new_state['stack'],
+            pot_contribution=old_state['current_pot']
+        )
+        
+        equity_reward = self.calculate_equity_reward(
+            initial_equity=old_state['calculated_equity'],
+            final_equity=new_state['calculated_equity'],
+            street=old_state['street']
+        )
+
+        # 需要实现期望价值估算
+        expected_value = self.estimate_expected_value(old_state)
+        
+        action_quality = self.evaluate_action_quality(
+            action=action,
+            game_state=old_state,
+            expected_value=expected_value
+        )
+
+        exploit_bonus = self.calculate_exploitation_bonus(
+            action=action,
+            opp_profile=opp_profile
+        )
+
+        # 综合奖励
+        total_reward = (
+            chip_reward * 0.6 +
+            equity_reward * 0.25 +
+            action_quality * 0.1 +
+            exploit_bonus * 0.05
+        )
+
+        # 终局奖励放大
+        if not new_state['active_players'][self.player_id]:
+            total_reward *= 2.5 if new_state['stack'] > old_state['stack'] else -1.5
+
+        return total_reward
+    
+    def _predict_q_value(self, features):
+        """预测各动作Q值"""
+        stage = self.current_stage
+        if stage in ['turn', 'river']:
+            with torch.no_grad():
+                tensor_features = torch.FloatTensor(features).unsqueeze(0)
+                stage_idx = torch.LongTensor([[STAGES.index(stage)]])
+                q_values, _ = self.stage_models[stage](tensor_features, stage_idx)
+                return q_values.numpy()[0]
+        else:
+            return self.stage_models[stage].predict_proba([features])[0]
+        
+    def _update_tree_models(self, X, y):
+        """更新XGBoost/GBDT模型"""
+        # 转换标签
+        y_labels = np.argmax(y, axis=1)
+        
+        # 更新preflop模型
+        if hasattr(self.stage_models['preflop'], 'partial_fit'):
+            self.stage_models['preflop'].partial_fit(X, y_labels, classes=[0,1,2])
+        
+        # 更新flop模型
+        self.stage_models['flop'].fit(X, y_labels)
+
+    def update_equity(self, game_state, force_update=False):
+        """
+        动态更新游戏状态的胜率（带缓存和增量更新）
+        :param game_state: 当前游戏状态字典（会被修改）
+        :param force_update: 是否强制重新计算（默认使用缓存）
+        """
+        # 生成缓存键
+        cache_key = self._generate_equity_cache_key(game_state)
+
+        # 加锁保证线程安全
+        with self.cache_lock:
+            if not force_update and cache_key in self.equity_cache:
+                self.cache_hits += 1
+                game_state['calculated_equity'] = self.equity_cache[cache_key]
+                return
+            
+            self.cache_misses += 1
+        
+        # 检查缓存是否有效
+        if not force_update and cache_key in self.equity_cache:
+            game_state['calculated_equity'] = self.equity_cache[cache_key]
+            return
+        
+        # 获取必要参数
+        hero_hand = game_state['hero_hand']
+        community = game_state['community']
+        street = game_state['street']
+        
+        # 根据阶段调整迭代次数（性能优化）
+        iteration_map = {
+            'preflop': 500,   # 翻前精确度要求低
+            'flop': 1000,
+            'turn': 2000,
+            'river': 5000     # 河牌需要高精度
+        }
+        iterations = iteration_map.get(street, 1000)
+        
+        # 调用模拟器计算胜率
+        simulator = EnhancedPokerSimulator()
+        equity, _ = simulator.calculate_equity(
+            hero_hand=hero_hand,
+            community=community,
+            iterations=iterations,
+            street=street
+        )
+        
+        # 更新状态并缓存
+        game_state['calculated_equity'] = equity
+        self.equity_cache[cache_key] = equity
+        
+        # 缓存清理（LRU机制）
+        if len(self.equity_cache) > 1000:
+            oldest_key = next(iter(self.equity_cache))
+            del self.equity_cache[oldest_key]
+
+        # 更新缓存（再次加锁）
+        with self.cache_lock:
+            self.equity_cache[cache_key] = equity
+            if len(self.equity_cache) > 1000:
+                # LRU淘汰策略
+                oldest_key = next(iter(self.equity_cache))
+                del self.equity_cache[oldest_key]
+
+    def _generate_equity_cache_key(self, game_state):
+        """生成唯一的胜率缓存键"""
+        # 获取牌面信息
+        hero_cards = tuple(sorted(Card.int_to_str(c) for c in game_state['hero_hand']))
+        community_cards = tuple(sorted(Card.int_to_str(c) for c in game_state['community']))
+        
+        # 生成哈希键
+        hash_str = f"{hero_cards}|{community_cards}|{game_state['street']}"
+        return hashlib.md5(hash_str.encode()).hexdigest()
+    
+    @property
+    def cache_status(self):
+        return {
+            'hits': self.cache_hits,
+            'misses': self.cache_misses,
+            'hit_rate': self.cache_hits / (self.cache_hits + self.cache_misses + 1e-8),
+            'size': len(self.equity_cache)
+        }
 
 
 #-----------------------------------------------------------------------------------------------
 
-def get_gto_baseline(self, game_state):
-    street = game_state.get('street', 'preflop')
-    position = game_state.get('position', 'BTN')
-    if street == 'preflop':
-        if position in ['BTN', 'CO']:
-            return {'fold': 0.15, 'call': 0.35, 'raise': 0.5}
-        else:
-            return {'fold': 0.25, 'call': 0.5, 'raise': 0.25}
-    elif street == 'flop':
-        return {'fold': 0.20, 'call': 0.5, 'raise': 0.3}
-    elif street == 'turn':
-        return {'fold': 0.25, 'call': 0.6, 'raise': 0.15}
-    elif street == 'river':
-        return {'fold': 0.3, 'call': 0.6, 'raise': 0.1}
-    else:
-        return {'fold': 0.33, 'call': 0.34, 'raise': 0.33}
+# ====================== 新增奖励归一化类 ======================
+class RewardNormalizer:
+    def __init__(self, buffer_size=10000, epsilon=1e-8):
+        """
+        动态奖励归一化器
+        :param buffer_size: 统计窗口大小（默认保留最近1万条奖励）
+        :param epsilon: 防止除零的小量
+        """
+        self.buffer = deque(maxlen=buffer_size)
+        self.epsilon = epsilon
+        self.mean = 0.0
+        self.std = 1.0
+        
+    def update_stats(self):
+        """更新统计量（均值/标准差）"""
+        if len(self.buffer) == 0:
+            return
+        
+        # 计算指数移动平均（EMA）更关注近期数据
+        alpha = 0.1  # 新旧数据权重
+        new_mean = np.mean(self.buffer)
+        new_std = np.std(self.buffer)
+        
+        self.mean = alpha * new_mean + (1 - alpha) * self.mean
+        self.std = alpha * new_std + (1 - alpha) * self.std
+        
+    def normalize(self, reward):
+        """
+        归一化奖励值
+        :param reward: 原始奖励值
+        :return: 标准化后的奖励值（Z-Score）
+        """
+        self.buffer.append(reward)
+        self.update_stats()
+        
+        # 防止初始阶段标准差为零
+        safe_std = self.std if self.std > self.epsilon else 1.0
+        return (reward - self.mean) / safe_std
+    
+    def denormalize(self, normalized_reward):
+        """反归一化（用于调试）"""
+        return normalized_reward * self.std + self.mean
 
-def calculate_chip_reward(old_stack, new_stack, pot_contribution):
-    """计算筹码变化的基础奖励"""
-    delta = new_stack - old_stack
-    # 风险调整：投入筹码越多，奖励需考虑风险系数
-    risk_factor = 1 - (pot_contribution / (old_stack + 1e-8))  # 防止除零
-    return delta * risk_factor
 
-def calculate_equity_reward(initial_equity, final_equity, street):
-    """根据胜率变化计算奖励"""
-    equity_gain = final_equity - initial_equity
-    # 阶段权重：越后期胜率变化越重要
-    stage_weights = {'preflop': 0.3, 'flop': 0.5, 'turn': 0.7, 'river': 1.0}
-    return equity_gain * stage_weights.get(street, 0.5)
-
-def evaluate_action_quality(action, game_state, expected_value):
-    """评估动作的合理性（基于GTO基准）"""
-    # 获取GTO推荐动作概率
-    gto_probs = get_gto_baseline(game_state)
-    
-    # 计算动作偏离度
-    action_idx = ACTION_SPACE.index(action)
-    deviation = 1 - gto_probs[action]  # 偏离GTO建议的程度
-    
-    # 价值调整：实际收益与期望值的差异
-    value_diff = (actual_result - expected_value) * 100
-    return value_diff - deviation * 0.5
-
-def calculate_exploitation_bonus(action, opp_profile):
-    """根据对手类型给予额外奖励"""
-    style = opp_profile.get('style', 'balanced')
-    # 针对不同对手风格的奖励调整
-    style_bonus = {
-        'aggressive': {'fold': 0, 'call': -0.2, 'raise': 0.3},
-        'passive':    {'fold': 0.2, 'call': 0, 'raise': -0.1},
-        'tight':      {'fold': -0.3, 'call': 0.1, 'raise': 0.2},
-        'loose':      {'fold': 0.3, 'call': -0.1, 'raise': 0}
-    }.get(style, {})
-    return style_bonus.get(action, 0)
-
-def calculate_reward(game_state, action, new_state, opp_profile):
-    """综合奖励计算"""
-    # 基础奖励
-    chip_reward = calculate_chip_reward(
-        old_stack=game_state['stack'],
-        new_stack=new_state['stack'],
-        pot_contribution=game_state['current_pot']
-    )
-    
-    # 胜率变化奖励
-    equity_reward = calculate_equity_reward(
-        initial_equity=game_state['calculated_equity'],
-        final_equity=new_state['calculated_equity'],
-        street=game_state['street']
-    )
-    
-    # 动作质量评估
-    action_quality = evaluate_action_quality(
-        action=action,
-        game_state=game_state,
-        expected_value=game_state['expected_value']
-    )
-    
-    # 对手剥削奖励
-    exploit_bonus = calculate_exploitation_bonus(action, opp_profile)
-    
-    # 合成总奖励（可调权重）
-    total_reward = (
-        chip_reward * 0.6 +
-        equity_reward * 0.25 +
-        action_quality * 0.1 +
-        exploit_bonus * 0.05
-    )
-    
-    # 终局奖励放大
-    if new_state['game_ended']:
-        total_reward *= 2.5  # 增强最终结果的奖励信号
-    
-    return total_reward
 
 # ====================== 演示主流程 ======================
 if __name__ == "__main__":
-    # 初始化AI
+    # 测试缓存系统
     poker_ai = HybridPokerAI()
-
-    # 模拟100局游戏进行在线学习
-    for _ in range(100):
-        # 1. 获取游戏状态
-        game_state = simulate_game_state()
-        
-        # 2. AI决策
-        action = poker_ai.decide_action(game_state)
-        
-        # 3. 环境反馈（假设此处模拟游戏结果）
-        game_result = simulate_outcome(game_state, action)
-        reward = calculate_reward(game_result)
-        
-        # 4. 提取特征并存储经验
-        features = poker_ai.extract_features(game_state)
-        experience = (features['context'], action, reward)
-        
-        # 5. 触发在线学习
-        poker_ai.online_learn(experience)
+    
+    # 第一次计算（应触发缓存未命中）
+    state1 = simulate_game_state()
+    poker_ai.update_equity(state1)
+    print("首次计算结果:", state1['calculated_equity'])
+    print("缓存状态:", poker_ai.cache_status)  # 应显示 misses=1
+    
+    # 相同状态再次计算（应命中缓存）
+    state2 = state1.copy()
+    poker_ai.update_equity(state2)
+    print("缓存命中后结果:", state2['calculated_equity'])
+    print("缓存状态:", poker_ai.cache_status)  # 应显示 hits=1
+    
+    # 强制重新计算
+    poker_ai.update_equity(state1, force_update=True)
+    print("强制更新后结果:", state1['calculated_equity'])
+    print("缓存状态:", poker_ai.cache_status)  # misses=2
 
 
 
 
 
 
-    # poker_ai = HybridPokerAI()
-    # game_state = simulate_game_state()
-    # decision = poker_ai.decide_action(game_state)
-    # print("当前牌局状态：")
-    # print(f"手牌: {[Card.int_to_str(c) for c in game_state['hero_hand']]}")
-    # print(f"公共牌: {[Card.int_to_str(c) for c in game_state['community']]}")
-    # print(f"位置: {game_state['position']}")
-    # print("\n推荐决策：")
-    # for action in decision:
-    #     print(f"- {action}")
+
+
+
+
+
+
+
+    # # 查看在线学习效果
+    # test_state = simulate_game_state()
+    # print("初始决策:", poker_ai.decide_action(test_state))
+
+    # # 运行1000局学习
+    # for _ in range(1000):
+    #     run_full_episode(poker_ai)
+
+    # print("训练后决策:", poker_ai.decide_action(test_state))
+
+
+
+    poker_ai = HybridPokerAI()
+    game_state = simulate_game_state()
+    decision = poker_ai.decide_action(game_state)
+    print("当前牌局状态：")
+    print(f"手牌: {[Card.int_to_str(c) for c in game_state['hero_hand']]}")
+    print(f"公共牌: {[Card.int_to_str(c) for c in game_state['community']]}")
+    print(f"位置: {game_state['position']}")
+    print("\n推荐决策：")
+    for action in decision:
+        print(f"- {action}")
