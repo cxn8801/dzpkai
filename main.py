@@ -7,7 +7,7 @@ import lobby_pb2
 import dzpk_pb2
 from enum import Enum
 from loguru import logger
-import solver
+# import solver
 
 logger.add("poker.log", rotation="100 MB")  # 自动轮转日志
 
