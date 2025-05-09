@@ -31,28 +31,31 @@ STAGES = ['preflop', 'flop', 'turn', 'river']
 POSITIONS = ['UTG', 'MP', 'CO', 'BTN', 'SB', 'BB']
 ACTION_SPACE = ['fold', 'call', 'raise']
 
+BB = 1.0       # 大盲单位
+SB = 0.5       # 小盲单位
+
 def create_card(card_str):
     """字符串转treys Card对象"""
     return Card.new(card_str)
 
 def simulate_game_state():
-    """模拟一个典型游戏状态"""
-    game_state = {
+    """完全使用BB单位的游戏状态"""
+    return {
         'player_id': 5,
-        'hero_hand': [create_card('3h'), create_card('2d')],
+        'hero_hand': [create_card('Ah'), create_card('Kd')],
         'community': [create_card('Qs'), create_card('Jh'), create_card('Tc')],
         'street': 'flop',
         'position': 'BTN',
-        'current_pot': 150,
+        'current_pot': 5.0,       # BB单位
         'previous_actions': [
-            {'action': 'raise', 'bet_size': 50},
-            {'action': 'call', 'bet_size': 20}
+            {'action': 'raise', 'bet_size': 0.83},  # BB单位
+            {'action': 'call', 'bet_size': 0.33}    # BB单位
         ],
-        'stack': 1000,
-        'to_call': 20
+        'stack': 16.67,          # BB单位
+        'to_call': 0.33,         # BB单位
+        'big_blind': BB,         # 固定1BB
+        'small_blind': SB        # 固定0.5BB
     }
-
-    return game_state
 
 # ====================== Range与牌力模块 ======================
 class RangeManager:
@@ -234,19 +237,31 @@ class OpponentProfiler:
         features = self._extract_behavior_features(game_state['player_id'])
         cluster = self.cluster_model.predict([features])[0]
         return self._get_cluster_profile(cluster)
+    
     def _init_clustering(self):
         return MiniBatchKMeans(n_clusters=5, random_state=42)
+    
     def _extract_behavior_features(self, player_id):
+        """
+        提取对手行为特征
+        返回: [激进率, 平均下注（BB单位）, 总下注次数]
+        """
         seq = self.action_sequences.get(player_id, [])
         if not seq:
-            return [0.5, 0, 0]
+            return [0.5, 0.0, 0]  # 默认激进率0.5, 平均下注0BB, 下注次数0
+
         actions = [a['action'] for a in seq]
+        # bet_sizes字段全为BB单位
         bet_sizes = [a['bet_size'] for a in seq if 'bet_size' in a]
+
         aggressive_count = sum(1 for a in actions if a in ['raise', 'bet'])
         total_count = len(actions)
-        avg_bet = np.mean(bet_sizes) if bet_sizes else 0
-        aggressive_ratio = aggressive_count / total_count if total_count else 0
-        return [aggressive_ratio, avg_bet, total_count]
+        avg_bet_bb = np.mean(bet_sizes) if bet_sizes else 0.0  # BB单位
+        aggressive_ratio = aggressive_count / total_count if total_count else 0.0
+
+        # 返回全部为BB单位的特征
+        return [aggressive_ratio, avg_bet_bb, total_count]
+    
     def _get_cluster_profile(self, cluster):
         profiles = {
             0: {"style": "aggressive", "fold": 0.2, "call": 0.3, "raise": 0.5},
@@ -327,37 +342,43 @@ class HybridPokerAI:
         self.cache_lock = Lock()
 
     def _train_meta_learner(self):
+        """
+        训练元学习器
+        所有涉及金额的特征（如stack, pot, bet_size等）均为BB单位
+        """
         historical_data = self._load_decision_history()
         if not historical_data:
             print("无有效历史记录，跳过元学习器训练")
             return
-        
-        # 特征提取兼容处理
+
         X = []
         y = []
         for d in historical_data:
-            # 处理不同版本数据格式
+            # 兼容新版和旧版特征结构，所有金额相关字段都以BB单位存储
             features = d.get('features', [])
-            if isinstance(features, dict):  # 处理新版特征结构
+            if isinstance(features, dict):
+                # context和stage_features都应为BB单位
                 features = features.get('context', []) + features.get('stage_features', [])
             
-            # 确保特征维度正确
+            # 假如历史数据有chip为单位的，需要这里转换为BB单位
+            # 例如：features[i] = features[i] / BB_chip_value  # 视具体特征定义而定
+            # 若已统一为BB则无需处理
+
             if len(features) >= NUM_FEATURES:
-                X.append(features[:NUM_FEATURES])  # 截断多余特征
+                X.append(features[:NUM_FEATURES])  # 截断多余特征，全部为BB
                 weights = d.get('weights', [0.33, 0.34, 0.33])
                 y.append(weights)
-        
-        if len(X) < 10:  # 最小训练样本阈值
+
+        if len(X) < 10:
             print(f"有效样本不足 ({len(X)})，跳过训练")
             return
-        
-        # 转换为numpy数组
+
         X = np.array(X)
         y = np.array(y)
-        
-        # 训练元学习器
+
+        # 明确所有X中金额特征为BB单位（如stack、pot、bet_size等）
         self.meta_learner.fit(X, y)
-        print("元学习器训练完成，特征维度:", X.shape)
+        print("元学习器训练完成，特征维度:", X.shape, "（金额全部为BB单位）")
 
     def _load_decision_history(self):
         historical_data = []
@@ -459,12 +480,24 @@ class HybridPokerAI:
     def format_decision(self, blended_probs, game_state):
         total = sum(blended_probs.values()) or 1
         actions = []
+        
+        # 关键修正：直接读取 big_blind，确保值存在
+        big_blind = game_state['big_blind']  # 确保此处为 1.0
+        min_raise = max(2 * big_blind, 1.0)  # 明确为 2BB 或 1.0 的较大值
+        
+        max_raise = game_state['stack']
+        equity = game_state.get('calculated_equity', 0.5)
+        base_raise = max(
+            min_raise,
+            game_state['current_pot'] * (0.4 + 0.3 * equity)
+        )
+        raise_bb = round(min(base_raise, max_raise), 2)
+        
         for action in ACTION_SPACE:
             prob = blended_probs.get(action, 0.0) / total
             percent = int(prob * 100)
-            if action in ['raise', 'bet']:
-                size = int(game_state['current_pot'] * 0.6)
-                actions.append(f"{percent}% {action} {size}BB")
+            if action == 'raise':
+                actions.append(f"{percent}% {action} {raise_bb}BB")
             else:
                 actions.append(f"{percent}% {action}")
         return actions
@@ -508,8 +541,10 @@ class HybridPokerAI:
 
     def _create_initial_models(self):
         print("正在生成初始模型文件...")
-        dummy_X = np.random.rand(100, NUM_FEATURES)  # 确保特征数量为 NUM_FEATURES
-        dummy_y = np.random.randint(0, 3, 100)
+        # 修改训练样本生成逻辑
+        dummy_X = np.random.rand(100, NUM_FEATURES)
+        # 调整标签分布反映BB单位策略
+        dummy_y = np.random.choice([0,1,2], p=[0.3,0.4,0.3], size=100)
 
         # 训练 preflop 模型
         self.stage_models['preflop'].fit(dummy_X, dummy_y)
@@ -545,6 +580,13 @@ class HybridPokerAI:
                 pass
 
     def decide_action(self, game_state):
+        # 添加短码全押判断 ← 新增逻辑
+        if game_state['stack'] <= 2.0:  # 当筹码≤2BB时
+            return ['0% fold', '0% call', '100% all-in'] 
+        
+        if 'big_blind' not in game_state:
+            game_state['big_blind'] = BB  # 默认 1BB
+        
         raw_features = self.extract_features(game_state)
 
         # 提取阶段特异性特征
@@ -594,19 +636,6 @@ class HybridPokerAI:
         self._record_decision(game_state, final_probs)
         print("决策记录已生成")  # 调试日志
         return self.format_decision(final_probs, game_state)
-
-    def format_decision(self, blended_probs, game_state):
-        total = sum(blended_probs.values()) or 1
-        actions = []
-        for action in ACTION_SPACE:
-            prob = blended_probs.get(action, 0.0) / total
-            percent = int(prob * 100)
-            if action in ['raise', 'bet']:
-                size = int(game_state['current_pot'] * 0.6)
-                actions.append(f"{percent}% {action} {size}BB")
-            else:
-                actions.append(f"{percent}% {action}")
-        return actions
 
     def _preprocess_preflop(self, raw_features):
         features = np.array(raw_features['context'] + raw_features['stage_features'])
@@ -663,14 +692,15 @@ class HybridPokerAI:
         )
 
         # 提取 context 特征
+        # 修改后的context特征（移除错误的比例缩放）
         context = [
             equity,
             len(game_state['community']),
-            game_state['current_pot'] / 100,
+            game_state['current_pot'],  # 直接使用BB单位 ← 修改点
             int(game_state['position'] in ['BTN', 'CO']),
             len(game_state.get('previous_actions', [])),
-            game_state.get('to_call', 0) / game_state['current_pot'] if game_state['current_pot'] > 0 else 0,
-            game_state.get('stack', 1000) / 1000
+            game_state.get('to_call', 0) / (game_state['current_pot'] + 1e-8),  # 用BB单位计算比例 ← 修改点
+            game_state.get('stack', 100)  # 直接使用BB单位 ← 修改点
         ]
 
         # 填充或裁剪 context 特征到固定长度（如 7）
@@ -858,21 +888,27 @@ class HybridPokerAI:
         if action_type == 'fold':
             new_state['active_players'][self.player_id] = False
         elif action_type == 'call':
-            new_state['current_bet'] = game_state['to_call']
-            new_state['stack'] -= game_state['to_call']
-            new_state['pot'] += game_state['to_call']
+            # 跟注：用BB单位
+            to_call = new_state.get('to_call', 0.0)  # BB
+            new_state['stack'] -= to_call
+            new_state['current_pot'] += to_call
+            # 更新已投入
+            new_state['previous_actions'].append({'action': 'call', 'bet_size': to_call})
         elif action_type == 'raise':
-            raise_size = max(bet_size, game_state['min_raise'])
-            new_state['current_bet'] += raise_size
+            # 加注，bet_size已为BB单位
+            min_raise = new_state.get('min_raise', 2 * new_state['big_blind'])  # BB
+            raise_size = max(min_raise, bet_size)  # BB
+            raise_size = min(raise_size, new_state['stack'])  # 不能超出all-in
             new_state['stack'] -= raise_size
-            new_state['pot'] += raise_size
-            new_state['min_raise'] = raise_size * 2
+            new_state['current_pot'] += raise_size
+            new_state['min_raise'] = raise_size  # 记录本轮最小加注量（BB）
+            new_state['previous_actions'].append({'action': 'raise', 'bet_size': raise_size})
         
         # 推进游戏阶段
         if self._should_advance_street(new_state):
             new_state['street'] = self._next_street(new_state['street'])
-            new_state['current_bet'] = 0
-            new_state['min_raise'] = new_state['big_blind']
+            new_state['min_raise'] = new_state['big_blind']  # BB
+            # 不重置current_pot，pot一直累计BB
         
         # 计算新胜率
         if new_state['street'] != game_state['street']:
@@ -895,11 +931,10 @@ class HybridPokerAI:
         return streets[current_index + 1] if current_index < 3 else current_street
     
     def calculate_chip_reward(self, old_stack, new_stack, pot_contribution):
-        """计算筹码变化的基础奖励"""
+        """使用BB单位计算"""
         delta = new_stack - old_stack
-        # 风险调整：投入筹码越多，奖励需考虑风险系数
-        risk_factor = 1 - (pot_contribution / (old_stack + 1e-8))  # 防止除零
-        return delta * risk_factor
+        risk_factor = 1 - (pot_contribution / (old_stack + 1e-8))
+        return delta * risk_factor  # 直接使用BB单位 ← 修改点
     
     def calculate_equity_reward(self, initial_equity, final_equity, street):
         """根据胜率变化计算奖励"""
@@ -1161,36 +1196,50 @@ class RewardNormalizer:
 
 # ====================== 演示主流程 ======================
 if __name__ == "__main__":
+    poker_ai = HybridPokerAI()
+    game_state = simulate_game_state()
+    decision = poker_ai.decide_action(game_state)
+    print("当前牌局状态：")
+    print(f"手牌: {[Card.int_to_str(c) for c in game_state['hero_hand']]}")
+    print(f"公共牌: {[Card.int_to_str(c) for c in game_state['community']]}")
+    print(f"位置: {game_state['position']}")
+    print("\n推荐决策：")
+    for action in decision:
+        print(f"- {action}")
+
+
+
+
     # 测试缓存系统
     # 完整的在线学习循环
-    ai = HybridPokerAI()
-    env = PokerEnvironment()
+    # ai = HybridPokerAI()
+    # env = PokerEnvironment()
 
-    for episode in range(10000):
-        state = env.reset()
-        episode_memory = []
+    # for episode in range(10000):
+    #     state = env.reset()
+    #     episode_memory = []
         
-        while not env.done:
-            action = ai.decide_action(state)
-            next_state, reward, done = env.step(action)
+    #     while not env.done:
+    #         action = ai.decide_action(state)
+    #         next_state, reward, done = env.step(action)
             
-            # 存储经验
-            ai.memory.store((state, action, reward, next_state, done))
-            episode_memory.append((state, action, reward))
+    #         # 存储经验
+    #         ai.memory.store((state, action, reward, next_state, done))
+    #         episode_memory.append((state, action, reward))
             
-            state = next_state
+    #         state = next_state
         
-        # 计算完整轨迹的TD误差
-        returns = calculate_returns([r for (s,a,r) in episode_memory])
+    #     # 计算完整轨迹的TD误差
+    #     returns = calculate_returns([r for (s,a,r) in episode_memory])
         
-        # 执行在线学习
-        if len(ai.memory) > 512:
-            batch = ai.memory.sample(512)
-            ai.online_learn(batch)
+    #     # 执行在线学习
+    #     if len(ai.memory) > 512:
+    #         batch = ai.memory.sample(512)
+    #         ai.online_learn(batch)
         
-        # 定期保存模型
-        if episode % 100 == 0:
-            ai.save_model(f'models/episode_{episode}.pt')
+    #     # 定期保存模型
+    #     if episode % 100 == 0:
+    #         ai.save_model(f'models/episode_{episode}.pt')
 
 
 
