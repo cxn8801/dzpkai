@@ -979,6 +979,8 @@ class HybridPokerAI:
 
     def calculate_reward(self, old_state, action, new_state):
         """完整奖励计算实现"""
+        # 增加期望价值计算
+        expected_value = self.estimate_expected_value(old_state)
         # 计算实际筹码变化
         actual_result = new_state['stack'] - old_state['stack']
         
