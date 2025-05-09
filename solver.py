@@ -8,6 +8,7 @@ import joblib
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.dummy import DummyClassifier
 import numpy as np
+import json
 
 # ======================
 # 核心优化模块
@@ -262,6 +263,54 @@ class DecisionEngine:
         """基于底池的智能下注量"""
         pot_size = game_state['current_pot']
         return int(pot_size * 0.6)  # 下注60%底池
+
+# 第一阶段 基础数据生成
+def generate_base_data():
+    # 生成手牌范围数据
+    RangeManager().generate_ranges()
+
+    # 生成10000条模拟数据
+    X = np.random.rand(10000, 5)
+    y = np.random.choice([0, 1, 2], 10000)  # 0:fold, 1:call, 2:raise
+    model = RandomForestClassifier(n_estimators=100).fit(X, y)
+    joblib.dump(model, 'poker_model.pkl')
+
+
+# 第二阶段：数据收集系统
+class DataCollector:
+    def __init__(self):
+        self.dataset = []
+    
+    def record_decision(self, features, action):
+        """记录特征和对应动作"""
+        self.dataset.append({
+            'features': features,
+            'action': action,
+            'timestamp': time.time()
+        })
+    
+    def save_data(self, path='poker_data.json'):
+        with open(path, 'w') as f:
+            json.dump(self.dataset, f)
+
+def train_model():
+    # 加载收集的数据
+    with open('poker_data.json') as f:
+        data = json.load(f)
+    
+    X = np.array([d['features'] for d in data])
+    y = np.array([d['action'] for d in data])
+    
+    # 使用更先进的模型
+    from xgboost import XGBClassifier
+    model = XGBClassifier().fit(X, y)
+    
+    # 模型验证
+    from sklearn.metrics import classification_report
+    print(classification_report(y, model.predict(X)))
+    
+    joblib.dump(model, 'poker_model_v2.pkl')
+
 
 # ======================
 # 示例用法
