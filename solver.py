@@ -644,35 +644,6 @@ class HybridPokerAI:
 
 
 # ======================
-# 数据生成和特征工程
-# ======================
-class PokerDataGenerator:
-    def __init__(self):
-        self.simulator = EquityCalculator()
-        self.feature_builder = FeatureEngineer()
-        self.dataset = []
-    
-    def generate(self, num_games=100000):
-        """生成训练数据"""
-        for _ in range(num_games):
-            game = self._simulate_full_hand()
-            for stage in STAGES:
-                features = self.feature_builder.build_features(game, stage)
-                label = self._get_optimal_action(game, stage)
-                self.dataset.append((features, label))
-    
-    def _simulate_full_hand(self):
-        """模拟完整牌局"""
-        # 实现完整的牌局模拟逻辑
-        pass
-    
-    def _get_optimal_action(self, game, stage):
-        """使用CFR算法生成最优动作标签"""
-        # 实现反事实遗憾最小化算法
-        pass
-
-
-# ======================
 # 对手建模系统
 # ======================
 class OpponentProfiler:
@@ -738,65 +709,7 @@ class OpponentProfiler:
         # 若聚类号超出范围，返回默认
         return profiles.get(cluster, {"style": "unknown", "fold": 0.33, "call": 0.34, "raise": 0.33})
     
-# ======================
-# 实时决策引擎
-# ======================
-class DecisionEngine:
-    def __init__(self):
-        self.ai = HybridPokerAI()
-        self.context = {}
-        self.history = []
-    
-    def process_decision(self, game_state):
-        # 更新上下文
-        self._update_context(game_state)
-        
-        # 获取机器学习预测
-        ml_probs = self.ai.decide_action(game_state)
-        
-        # 计算博弈论策略
-        gto_probs = self._calculate_gto_strategy(game_state)
-        
-        # 动态融合策略
-        final_decision = self._dynamic_fusion(
-            ml_probs, 
-            gto_probs,
-            game_state
-        )
-        
-        return final_decision
-    
-    def _dynamic_fusion(self, ml_probs, gto_probs, game_state):
-        """基于牌局阶段和筹码深度动态调整策略"""
-        stage_weights = {
-            'preflop': 0.4,
-            'flop': 0.5,
-            'turn': 0.6,
-            'river': 0.7
-        }
-        stack_weight = np.tanh(game_state['stack'] / 1000)
-        
-        blended = {}
-        for action in ACTION_SPACE:
-            blended[action] = (
-                stage_weights[game_state['street']] * ml_probs[action] +
-                (1 - stage_weights[game_state['street']]) * gto_probs[action]
-            ) * stack_weight
-        return blended
-    
 
-# ======================
-# 辅助系统和工具
-# ======================
-class EquityCalculator:
-    """带缓存的胜率计算器"""
-    def __init__(self):
-        self.evaluator = Evaluator()
-        self.cache = {}
-    
-    @lru_cache(maxsize=1000000)
-    def calculate(self, hand, board):
-        return self.evaluator.evaluate(board, hand)
 
 class ExperienceReplayBuffer:
     """经验回放缓冲池"""
