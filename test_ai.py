@@ -542,11 +542,12 @@ class WebSocketClient:
 
     async def on_get_my_data(self, data):
         # await self.send_enter_friend_room()
-        await self.send_enter_room()
+        # await self.send_enter_room()
+        await self.send_enter_my_room()
         pass
 
     async def on_enter_room(self, data):
-        # logger.info('on_enter_room:{}', data)
+        logger.info('on_enter_room:{}', data)
         if data.roomPlayer.uid == self.my_uid:
             self.my_seat_number = data.roomPlayer.seatNumber
             self.available_chip = data.roomPlayer.takeChip
@@ -691,12 +692,28 @@ class WebSocketClient:
             game_state['street'] = 'turn'
         if self.room_status == RoomStatus.RoomStatusRiver:
             game_state['street'] = 'river'
-        
+
         logger.info("bank_id:{}", self.bank_id)
         pos = self.get_player_position(self.seat_info, self.bank_id, self.my_uid)
         game_state['position'] = pos
         logger.info("pos:{}", pos)
-        
+        game_state['current_pot'] = self.g_pot / self.big_blind
+
+        acts = []
+        for act in self.action_done:
+            if act["op"] == Op.Call:
+                acts.append({'action': 'call', 'bet_size': act.op.chip / self.big_blind})
+            if act["op"] == Op.Raise:
+                acts.append({'action': 'raise', 'bet_size': act.op.chip / self.big_blind})
+            if act["op"] == Op.Belt:
+                acts.append({'action': 'bet', 'bet_size': act.op.chip / self.big_blind})
+
+        for op in opButtons:
+            logger.info("op:{}", op)
+            logger.info("op:{}", op.buttonId)
+            if Op.Call == op.buttonId:
+                game_state['to_call'] = op.chip / self.big_blind
+                break
 
         # 获取当前可用的操作按钮
         self.available_ops = [Op(op.buttonId) for op in opButtons]
@@ -852,6 +869,7 @@ class WebSocketClient:
             else:
                 pass
             self.dict_money_on_table[player.uid] = player.currentTotalChip
+            self.seat_info[player.seatNumber] = player.uid
         g_pot = data.pot
         for card in data.handCards:
             self.my_hand_cards.append(convert_card(card))
@@ -865,6 +883,7 @@ class WebSocketClient:
         if data.errorCode != 0:
             # logger.info(data.errorMsg)
             await self.send_enter_room()
+            # await self.send_enter_friend_room()
         else:
             pass
 

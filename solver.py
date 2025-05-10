@@ -114,6 +114,24 @@ class EnhancedPokerSimulator:
 
         self.evaluator = CachedEvaluator() if use_cache else Evaluator()
 
+    def _execute_action(self, game_state, action_type):
+        """统一动作执行逻辑"""
+        new_state = game_state.copy()
+        record = {'action': action_type}
+
+        if action_type == 'call':
+            record['bet_size'] = new_state.get('to_call', 0.0)
+        elif action_type == 'raise':
+            # 计算实际加注量（BB单位）
+            last_bet = new_state.get('last_bet', 0.0)
+            min_raise = max(2 * last_bet, self.bb)
+            raise_size = max(min_raise, new_state['current_pot'] * 0.5)
+            raise_size = min(raise_size, new_state['stack'])
+            record['bet_size'] = raise_size
+
+        new_state['previous_actions'].append(record)
+        return new_state
+
     def _get_remaining_deck(self, known_cards):
         full_deck = set(Deck.GetFullDeck())
         return list(full_deck - set(known_cards))
@@ -243,8 +261,8 @@ class OpponentProfiler:
     
     def _extract_behavior_features(self, player_id):
         """
-        提取对手行为特征
-        返回: [激进率, 平均下注（BB单位）, 总下注次数]
+        修正后的行为特征提取方法
+        现在只使用raise作为激进行为标识
         """
         seq = self.action_sequences.get(player_id, [])
         if not seq:
@@ -252,11 +270,13 @@ class OpponentProfiler:
 
         actions = [a['action'] for a in seq]
         # bet_sizes字段全为BB单位
-        bet_sizes = [a['bet_size'] for a in seq if 'bet_size' in a]
+        bet_sizes = [a.get('bet_size', 0) for a in seq]
 
-        aggressive_count = sum(1 for a in actions if a in ['raise', 'bet'])
+        # 关键修改：只识别raise作为激进行为
+        aggressive_actions = ['raise']
+        aggressive_count = sum(1 for a in actions if a in aggressive_actions)
         total_count = len(actions)
-        avg_bet_bb = np.mean(bet_sizes) if bet_sizes else 0.0  # BB单位
+        avg_bet_bb = np.mean(bet_sizes) if bet_sizes else 0.0
         aggressive_ratio = aggressive_count / total_count if total_count else 0.0
 
         # 返回全部为BB单位的特征
@@ -478,13 +498,13 @@ class HybridPokerAI:
         }
     
     def format_decision(self, blended_probs, game_state):
+        """最终版决策格式化方法"""
         total = sum(blended_probs.values()) or 1
         actions = []
         
-        # 关键修正：直接读取 big_blind，确保值存在
-        big_blind = game_state['big_blind']  # 确保此处为 1.0
-        min_raise = max(2 * big_blind, 1.0)  # 明确为 2BB 或 1.0 的较大值
-        
+        # 获取加注量（BB单位）
+        bb = game_state['big_blind']
+        min_raise = max(2 * bb, 1.0)
         max_raise = game_state['stack']
         equity = game_state.get('calculated_equity', 0.5)
         base_raise = max(
@@ -492,14 +512,30 @@ class HybridPokerAI:
             game_state['current_pot'] * (0.4 + 0.3 * equity)
         )
         raise_bb = round(min(base_raise, max_raise), 2)
-        
+
         for action in ACTION_SPACE:
             prob = blended_probs.get(action, 0.0) / total
             percent = int(prob * 100)
-            if action == 'raise':
-                actions.append(f"{percent}% {action} {raise_bb}BB")
+            
+            # 特殊处理call/check
+            if action == 'call':
+                to_call_bb = game_state.get('to_call', 0.0)
+                
+                if to_call_bb == 0:  # check情况
+                    display_action = 'check'
+                    actions.append(f"{percent}% {display_action}")
+                else:  # 实际跟注
+                    # 格式化显示去零
+                    call_amount = f"{to_call_bb:.2f}BB".replace(".00BB", "BB")
+                    actions.append(f"{percent}% call {call_amount}")
+                    
+            elif action == 'raise':
+                # 格式化加注量显示
+                raise_str = f"{raise_bb:.2f}BB".replace(".00BB", "BB")
+                actions.append(f"{percent}% {action} {raise_str}")
             else:
                 actions.append(f"{percent}% {action}")
+
         return actions
 
     def _init_pytorch_model(self, stage):
@@ -580,9 +616,9 @@ class HybridPokerAI:
                 pass
 
     def decide_action(self, game_state):
-        # 添加短码全押判断 ← 新增逻辑
-        if game_state['stack'] <= 2.0:  # 当筹码≤2BB时
-            return ['0% fold', '0% call', '100% all-in'] 
+        # 短码全押特殊处理（优先判断）
+        if game_state['stack'] <= 2.0:  # ≤2BB时强制全押
+            return ['0% fold', '0% check', '100% all-in'] 
         
         if 'big_blind' not in game_state:
             game_state['big_blind'] = BB  # 默认 1BB
@@ -669,7 +705,7 @@ class HybridPokerAI:
             return [0.0, 0.0, 0]
 
         # 定义激进行为和被动行为
-        aggressive_actions = ['raise', 'bet']
+        aggressive_actions = ['raise']
         bet_sizes = [action.get('bet_size', 0) for action in previous_actions if 'bet_size' in action]
 
         # 统计数据
@@ -1208,70 +1244,6 @@ if __name__ == "__main__":
     print("\n推荐决策：")
     for action in decision:
         print(f"- {action}")
-
-
-
-
-    # 测试缓存系统
-    # 完整的在线学习循环
-    # ai = HybridPokerAI()
-    # env = PokerEnvironment()
-
-    # for episode in range(10000):
-    #     state = env.reset()
-    #     episode_memory = []
-        
-    #     while not env.done:
-    #         action = ai.decide_action(state)
-    #         next_state, reward, done = env.step(action)
-            
-    #         # 存储经验
-    #         ai.memory.store((state, action, reward, next_state, done))
-    #         episode_memory.append((state, action, reward))
-            
-    #         state = next_state
-        
-    #     # 计算完整轨迹的TD误差
-    #     returns = calculate_returns([r for (s,a,r) in episode_memory])
-        
-    #     # 执行在线学习
-    #     if len(ai.memory) > 512:
-    #         batch = ai.memory.sample(512)
-    #         ai.online_learn(batch)
-        
-    #     # 定期保存模型
-    #     if episode % 100 == 0:
-    #         ai.save_model(f'models/episode_{episode}.pt')
-
-
-
-
-
-    
-    # # 第一次计算（应触发缓存未命中）
-    # state1 = simulate_game_state()
-    # poker_ai.update_equity(state1)
-    # print("首次计算结果:", state1['calculated_equity'])
-    # print("缓存状态:", poker_ai.cache_status)  # 应显示 misses=1
-    
-    # # 相同状态再次计算（应命中缓存）
-    # state2 = state1.copy()
-    # poker_ai.update_equity(state2)
-    # print("缓存命中后结果:", state2['calculated_equity'])
-    # print("缓存状态:", poker_ai.cache_status)  # 应显示 hits=1
-    
-    # # 强制重新计算
-    # poker_ai.update_equity(state1, force_update=True)
-    # print("强制更新后结果:", state1['calculated_equity'])
-    # print("缓存状态:", poker_ai.cache_status)  # misses=2
-
-
-
-
-
-
-
-
 
 
 
