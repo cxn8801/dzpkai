@@ -24,6 +24,7 @@ import os
 import json
 from threading import Lock
 import re
+from collections import defaultdict, deque
 
 # ====================== 常量与工具 ======================
 NUM_FEATURES = 15
@@ -235,52 +236,85 @@ class GlobalContextNet(nn.Module):
 
 # ====================== 对手建模与经验回放 ======================
 class OpponentProfiler:
+    """实时对手建模系统"""
     def __init__(self):
-        self.cluster_model = self._init_clustering()
-        self.action_sequences = {}
-        dummy = np.zeros((5, 3))
-        self.cluster_model.partial_fit(dummy)
+        self.cluster_model = MiniBatchKMeans(n_clusters=5, random_state=42)
+        self.action_sequences = defaultdict(lambda: deque(maxlen=100))
+        self.profile_cache = {}
+        self.lock = Lock()
+
     def update(self, game_state):
-        player_id = game_state['player_id']
-        if player_id not in self.action_sequences:
-            self.action_sequences[player_id] = deque(maxlen=100)
-        self.action_sequences[player_id].append({
-            'action': game_state['action'],
-            'timing': game_state['timing'],
-            'bet_size': game_state['bet_size']
-        })
-        features = self._extract_behavior_features(player_id)
-        self.cluster_model.partial_fit([features])
+        """实时更新对手画像"""
+        with self.lock:
+            player_id = game_state['player_id']
+            action_record = {
+                'action': game_state['action'],
+                'bet_size': game_state.get('bet_size', 0) / game_state['big_blind'],  # 转换为BB单位
+                'timing': game_state.get('timing', 1.0)
+            }
+            
+            # 更新动作序列
+            self.action_sequences[player_id].append(action_record)
+            
+            # 提取特征并更新聚类
+            features = self._extract_behavior_features(player_id)
+            try:
+                self.cluster_model.partial_fit([features])
+                self.profile_cache[player_id] = self._get_cluster_profile(
+                    self.cluster_model.predict([features])[0]
+                )
+            except ValueError:
+                self.cluster_model = MiniBatchKMeans(n_clusters=5)
+                self.cluster_model.partial_fit([features])
+
     def predict(self, game_state):
-        features = self._extract_behavior_features(game_state['player_id'])
-        cluster = self.cluster_model.predict([features])[0]
-        return self._get_cluster_profile(cluster)
+        """获取当前对手画像"""
+        player_id = game_state['player_id']
+        with self.lock:
+            # 使用缓存提高性能
+            if player_id in self.profile_cache:
+                return self.profile_cache[player_id]
+            
+            # 新玩家默认画像
+            return {
+                "style": "unknown",
+                "fold": 0.33,
+                "call": 0.34,
+                "raise": 0.33
+            }
     
     def _init_clustering(self):
         return MiniBatchKMeans(n_clusters=5, random_state=42)
     
     def _extract_behavior_features(self, player_id):
-        """
-        修正后的行为特征提取方法
-        现在只使用raise作为激进行为标识
-        """
-        seq = self.action_sequences.get(player_id, [])
-        if not seq:
-            return [0.5, 0.0, 0]  # 默认激进率0.5, 平均下注0BB, 下注次数0
-
-        actions = [a['action'] for a in seq]
-        # bet_sizes字段全为BB单位
-        bet_sizes = [a.get('bet_size', 0) for a in seq]
-
-        # 关键修改：只识别raise作为激进行为
-        aggressive_actions = ['raise']
-        aggressive_count = sum(1 for a in actions if a in aggressive_actions)
-        total_count = len(actions)
-        avg_bet_bb = np.mean(bet_sizes) if bet_sizes else 0.0
-        aggressive_ratio = aggressive_count / total_count if total_count else 0.0
-
-        # 返回全部为BB单位的特征
-        return [aggressive_ratio, avg_bet_bb, total_count]
+        """精细化的行为特征提取"""
+        seq = list(self.action_sequences[player_id])
+        if len(seq) < 5:  # 最少需要5个动作
+            return [0.5, 0.0, 0.0, 0.5, 0.0]
+        
+        # 时间窗口特征
+        last_10 = seq[-10:]
+        last_5 = seq[-5:]
+        
+        # 关键指标计算
+        metrics = {
+            'agg_ratio_10': sum(1 for a in last_10 if a['action'] == 'raise') / 10,
+            'avg_bet_10': np.mean([a['bet_size'] for a in last_10]),
+            'timing_var': np.var([a['timing'] for a in last_10]),
+            'agg_ratio_5': sum(1 for a in last_5 if a['action'] == 'raise') / 5,
+            'bet_change': np.mean(np.diff([a['bet_size'] for a in last_5 if a['action'] == 'raise']))
+        }
+        
+        # 处理NaN值
+        features = [
+            metrics['agg_ratio_10'],
+            metrics['avg_bet_10'] if not np.isnan(metrics['avg_bet_10']) else 0.0,
+            metrics['timing_var'] if not np.isnan(metrics['timing_var']) else 0.1,
+            metrics['agg_ratio_5'],
+            metrics['bet_change'] if not np.isnan(metrics['bet_change']) else 0.0
+        ]
+        
+        return features
     
     def _get_cluster_profile(self, cluster):
         profiles = {
@@ -447,24 +481,50 @@ class HybridPokerAI:
         return {action: max(0, weight) for action, weight in zip(ACTION_SPACE, weights)}
     
     def _blend_strategies(self, ml_probs, game_state, opp_profile):
-        """融合 ML 预测、GTO 策略和对手调整策略"""
-        # 获取 GTO 基线概率
+        """动态权重策略融合（带探索机制）"""
+        # 获取元学习器权重预测
+        try:
+            context_features = self.extract_features(game_state)['context']
+            weights = self.meta_learner.predict([context_features])[0]
+        except Exception as e:
+            print(f"元学习器异常: {str(e)}")
+            weights = [0.5, 0.3, 0.2]  # 默认权重
+        
+        # 权重安全限制
+        weights = np.clip(weights, 0.1, 0.7)
+        weights /= np.sum(weights)  # 归一化
+
+        # 获取各策略基准
         gto_probs = self._get_gto_baseline(game_state)
+        opp_adjust = self._calculate_opponent_adjustment(opp_profile)
+        
+        # 转换机器学习概率
+        if isinstance(ml_probs, np.ndarray):
+            ml_dict = {
+                ACTION_SPACE[i]: float(ml_probs[i])
+                for i in range(len(ACTION_SPACE))
+            }
+        else:
+            ml_dict = ml_probs
 
-        # 获取对手调整概率
-        opp_adjustment = self._calculate_opponent_adjustment(opp_profile)
-
-        # 默认权重
-        weights = [0.6, 0.3, 0.1]  # 机器学习、GTO、对手调整的权重
-
-        blended = {}
-        for idx, action in enumerate(ACTION_SPACE):
+        # 混合计算
+        blended = defaultdict(float)
+        for action in ACTION_SPACE:
             blended[action] = (
-                weights[0] * ml_probs[idx] +
-                weights[1] * gto_probs[action] +
-                weights[2] * opp_adjustment[action]
+                weights[0] * ml_dict.get(action, 0.0) +
+                weights[1] * gto_probs.get(action, 0.0) +
+                weights[2] * opp_adjust.get(action, 0.0)
             )
-        return blended
+
+        # 添加探索噪声
+        exploration_rate = 0.08  # 8%探索率
+        noise = np.random.dirichlet([1,1,1]) * exploration_rate
+        for i, action in enumerate(ACTION_SPACE):
+            blended[action] = blended[action] * (1 - exploration_rate) + noise[i]
+
+        # 概率归一化
+        total = sum(blended.values())
+        return {k: v/total for k, v in blended.items()}
     
     def _get_gto_baseline(self, game_state):
         """根据 GTO 策略返回动作概率分布"""
@@ -498,43 +558,73 @@ class HybridPokerAI:
         }
     
     def format_decision(self, blended_probs, game_state):
-        """最终版决策格式化方法"""
-        total = sum(blended_probs.values()) or 1
+        """修正版决策格式化方法，确保概率总和100%"""
+        # 确保概率合法
+        blended_probs = {k: max(0, v) for k, v in blended_probs.items()}
+        total = sum(blended_probs.values())
+        
+        # 处理异常情况
+        if total <= 0:
+            return ["33% fold", "34% call", "33% raise"]
+
+        # 计算精确百分比
+        exact_percents = {
+            action: (prob / total) * 100 
+            for action, prob in blended_probs.items()
+        }
+
+        # 四舍五入到两位小数
+        rounded = {k: round(v, 2) for k, v in exact_percents.items()}
+        total_rounded = sum(rounded.values())
+
+        # 处理四舍五入误差
+        diff = round(100.00 - total_rounded, 2)
+        if diff != 0:
+            # 找到最大项调整差值
+            max_action = max(rounded, key=lambda x: rounded[x])
+            rounded[max_action] += diff
+            rounded[max_action] = round(rounded[max_action], 2)
+
+        # 格式化显示
         actions = []
+        bb = game_state['big_blind']
         
         # 获取加注量（BB单位）
-        bb = game_state['big_blind']
         min_raise = max(2 * bb, 1.0)
         max_raise = game_state['stack']
         equity = game_state.get('calculated_equity', 0.5)
-        base_raise = max(
-            min_raise,
-            game_state['current_pot'] * (0.4 + 0.3 * equity)
+        base_raise = min(
+            max(min_raise, game_state['current_pot'] * (0.4 + 0.3 * equity)),
+            max_raise
         )
-        raise_bb = round(min(base_raise, max_raise), 2)
+        raise_bb = round(base_raise, 2)
 
         for action in ACTION_SPACE:
-            prob = blended_probs.get(action, 0.0) / total
-            percent = int(prob * 100)
+            percent = rounded.get(action, 0.0)
             
+            # 处理小数点显示
+            if percent.is_integer():
+                display_percent = f"{int(percent)}%"
+            else:
+                display_percent = f"{percent:.2f}".rstrip('0').rstrip('.') + "%"
+
             # 特殊处理call/check
             if action == 'call':
-                to_call_bb = game_state.get('to_call', 0.0)
-                
-                if to_call_bb == 0:  # check情况
-                    display_action = 'check'
-                    actions.append(f"{percent}% {display_action}")
-                else:  # 实际跟注
-                    # 格式化显示去零
-                    call_amount = f"{to_call_bb:.2f}BB".replace(".00BB", "BB")
-                    actions.append(f"{percent}% call {call_amount}")
-                    
+                to_call = game_state.get('to_call', 0.0)
+                if to_call == 0:
+                    display_action = f"{display_percent} check"
+                else:
+                    call_bb = f"{to_call:.2f}BB".replace(".00BB", "BB")
+                    display_action = f"{display_percent} call {call_bb}"
+            
             elif action == 'raise':
-                # 格式化加注量显示
-                raise_str = f"{raise_bb:.2f}BB".replace(".00BB", "BB")
-                actions.append(f"{percent}% {action} {raise_str}")
+                raise_bb_str = f"{raise_bb:.2f}BB".replace(".00BB", "BB")
+                display_action = f"{display_percent} raise {raise_bb_str}"
+            
             else:
-                actions.append(f"{percent}% {action}")
+                display_action = f"{display_percent} {action}"
+
+            actions.append(display_action)
 
         return actions
 
@@ -555,25 +645,68 @@ class HybridPokerAI:
         return model
 
     def _load_model_weights(self):
-        preflop_path = f'{self.model_path}preflop_model.joblib'
-        flop_path = f'{self.model_path}flop_model.joblib'
-        if os.path.exists(preflop_path):
+        """增强版模型加载方法，带完整性校验"""
+        print("\n=== 模型加载流程开始 ===")
+        
+        # 预加载模型列表
+        model_files = {
+            'preflop': ('preflop_model.joblib', XGBClassifier),
+            'flop': ('flop_model.joblib', GradientBoostingClassifier),
+            'turn': ('turn_model.pth', StageLSTM),
+            'river': ('river_model.pth', StageLSTM)
+        }
+
+        for stage, (filename, model_type) in model_files.items():
+            filepath = os.path.join(self.model_path, filename)
             try:
-                self.stage_models['preflop'] = load(preflop_path)
+                if not os.path.exists(filepath):
+                    raise FileNotFoundError(f"{filename} 不存在")
+
+                # 加载并验证模型
+                if stage in ['turn', 'river']:
+                    model = self._init_pytorch_model(stage)
+                    model.load_state_dict(torch.load(filepath))
+                    model.eval()
+                    # 验证模型结构
+                    test_input = torch.randn(1, 32 if stage == 'turn' else 48)
+                    _ = model(test_input)  # 测试前向传播
+                else:
+                    model = joblib.load(filepath)
+                    # 验证特征数匹配
+                    if model.n_features_in_ != NUM_FEATURES:
+                        raise ValueError(f"特征数不匹配: 模型{model.n_features_in_} vs 定义{NUM_FEATURES}")
+
+                self.stage_models[stage] = model
+                print(f"✅ {stage}模型加载成功 | 特征数: {getattr(model, 'n_features_in_', 'N/A')}")
+
             except Exception as e:
-                print(f"加载preflop模型失败: {e}，使用新实例")
-        if os.path.exists(flop_path):
-            try:
-                self.stage_models['flop'] = load(flop_path)
-            except Exception as e:
-                print(f"加载flop模型失败: {e}，使用新实例并fit")
-                dummy_X = np.random.rand(100, 15)
-                dummy_y = np.random.randint(0, 3, 100)
-                self.stage_models['flop'].fit(dummy_X, dummy_y)
+                print(f"❌ {stage}模型加载失败: {str(e)}")
+                print("正在初始化应急模型...")
+                self._init_fallback_model(stage)
+
+        print("=== 模型加载完成 ===\n")
+
+    def _init_fallback_model(self, stage):
+        """应急模型初始化（带特征校验）"""
+        # 生成符合特征维度的假数据
+        dummy_X = np.random.rand(100, NUM_FEATURES)
+        dummy_y = np.random.choice([0,1,2], size=100)
+        
+        if stage in ['preflop', 'flop']:
+            if stage == 'preflop':
+                model = XGBClassifier(n_estimators=50)
+            else:
+                model = GradientBoostingClassifier()
+            model.fit(dummy_X, dummy_y)
         else:
-            dummy_X = np.random.rand(100, 15)
-            dummy_y = np.random.randint(0, 3, 100)
-            self.stage_models['flop'].fit(dummy_X, dummy_y)
+            model = StageLSTM(
+                input_size=32 if stage == 'turn' else 48,
+                hidden_size=64,
+                num_classes=3
+            )
+        
+        self.stage_models[stage] = model
+        print(f"⚠️ 应急{stage}模型已启用")
 
     def _create_initial_models(self):
         print("正在生成初始模型文件...")
@@ -722,41 +855,63 @@ class HybridPokerAI:
         return [aggressive_ratio, avg_bet, bet_count]
     
     def extract_features(self, game_state):
-        equity, _ = EnhancedPokerSimulator().calculate_equity(
-            game_state['hero_hand'],
-            game_state['community'],
-            iterations=200,
-            street=game_state['street']
-        )
+        """动态特征提取方法（带标准化和异常处理）"""
+        try:
+            # 基础特征（全部转换为BB单位）
+            bb = game_state['big_blind']
+            stack_bb = game_state['stack']
+            pot_bb = game_state['current_pot']
+            to_call_bb = game_state.get('to_call', 0.0)
+            equity = game_state.get('calculated_equity', 0.5)
+            position = POSITIONS.index(game_state['position'])
+            
+            # 标准化处理
+            normalized_features = [
+                equity,  # 原始胜率 0-1
+                pot_bb / 200,  # 假设最大底池200BB
+                stack_bb / 200,  # 假设最大筹码200BB
+                to_call_bb / (pot_bb + 1e-8),  # 跟注比例
+                position / (len(POSITIONS) - 1)  # 位置标准化
+            ]
 
-        # 提取 context 特征
-        # 修改后的context特征（移除错误的比例缩放）
-        context = [
-            equity,
-            len(game_state['community']),
-            game_state['current_pot'],  # 直接使用BB单位 ← 修改点
-            int(game_state['position'] in ['BTN', 'CO']),
-            len(game_state.get('previous_actions', [])),
-            game_state.get('to_call', 0) / (game_state['current_pot'] + 1e-8),  # 用BB单位计算比例 ← 修改点
-            game_state.get('stack', 100)  # 直接使用BB单位 ← 修改点
-        ]
+            # 对手动态特征（最近3轮动作）
+            opp_features = []
+            for action in game_state['previous_actions'][-3:]:
+                opp_features.extend([
+                    1 if action['action'] == 'raise' else 0,  # 激进行为标志
+                    action.get('bet_size', 0) / bb  # 转换为BB单位
+                ])
+            # 填充不足部分
+            while len(opp_features) < 6:  # 3轮动作×2特征
+                opp_features.append(0.0)
+            
+            # 时间动态特征
+            time_features = [
+                len(game_state['previous_actions']) / 20,  # 动作频率
+                (time.time() - game_state.get('hand_start', time.time())) / 60  # 牌局时长(分钟)
+            ]
 
-        # 填充或裁剪 context 特征到固定长度（如 7）
-        context_length = 7
-        if len(context) < context_length:
-            context = context + [0.0] * (context_length - len(context))  # 填充 0
-        elif len(context) > context_length:
-            context = context[:context_length]  # 截断
+            # 合并所有特征
+            full_features = normalized_features + opp_features[:6] + time_features
+            
+            # 特征维度校验
+            if len(full_features) < NUM_FEATURES:
+                full_features += [0.0] * (NUM_FEATURES - len(full_features))
+            elif len(full_features) > NUM_FEATURES:
+                full_features = full_features[:NUM_FEATURES]
 
-        stage_features = [
-            *self._get_stage_specific_features(game_state),
-        ]
+            return {
+                'context': np.array(full_features[:7], dtype=np.float32),
+                'stage_features': np.array(full_features[7:], dtype=np.float32)
+            }
 
-        # 修改后处理逻辑
-        return {
-            'context': np.array(context).flatten(),  # 确保一维化
-            'stage_features': np.array(stage_features).flatten()
-        }
+        except Exception as e:
+            print(f"特征提取异常: {str(e)}")
+            # 返回安全特征
+            return {
+                'context': np.zeros(7),
+                'stage_features': np.zeros(NUM_FEATURES-7)
+            }
     
     def _get_stage_specific_features(self, game_state):
         street = game_state['street']
@@ -864,55 +1019,63 @@ class HybridPokerAI:
             'raise': float(opp_profile.get('raise', 0.33)),
         }
     
-    #在线学习部分
     def online_learn(self, experience_batch):
-        """批量在线学习实现"""
-        # 转换经验格式
+        """增强版在线学习方法"""
+        # 转换经验数据
         states, actions, rewards, next_states, dones = zip(*experience_batch)
         
-        # 转换为模型输入格式
-        X = []
+        # 特征提取
+        X = [self.extract_features(s)['context'] for s in states]
         y = []
-        for i in range(len(states)):
-            # 提取特征
-            state_features = self.extract_features(states[i])['context']
-            next_features = self.extract_features(next_states[i])['context']
-            
-            # 当前Q值
-            current_q = self._predict_q_value(state_features)
-            
-            # 目标Q值
+        for i in range(len(experience_batch)):
+            # 计算目标Q值
+            current_q = self._predict_q_value(X[i])
             target = rewards[i]
             if not dones[i]:
-                next_q = self._predict_q_value(next_features)
-                target += self.gamma * np.max(next_q)
+                next_feature = self.extract_features(next_states[i])['context']
+                next_q = self._predict_q_value(next_feature)
+                target += 0.9 * np.max(next_q)  # 折扣因子0.9
             
-            # 更新动作对应的Q值
+            # 更新对应动作的Q值
             action_idx = ACTION_SPACE.index(actions[i])
             current_q[action_idx] = target
-            
-            X.append(state_features)
             y.append(current_q)
         
-        # 转换为Tensor
+        # 转换Tensor
         X_tensor = torch.FloatTensor(np.array(X))
         y_tensor = torch.FloatTensor(np.array(y))
         
-        # 训练神经网络
+        # 神经网络训练
         for stage in ['turn', 'river']:
             self.stage_models[stage].train()
-            optimizer = torch.optim.Adam(self.stage_models[stage].parameters())
+            optimizer = torch.optim.AdamW(self.stage_models[stage].parameters(), lr=0.001)
+            loss_fn = nn.SmoothL1Loss()  # Huber损失
             
-            # 训练循环
-            for _ in range(3):  # 小批量多次更新
-                predictions, _ = self.stage_models[stage](X_tensor)
-                loss = nn.MSELoss()(predictions, y_tensor)
+            for _ in range(3):  # 3次迭代
+                preds, _ = self.stage_models[stage](X_tensor)
+                loss = loss_fn(preds, y_tensor)
+                
                 optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.stage_models[stage].parameters(), 1.0)  # 梯度裁剪
                 optimizer.step()
         
-        # 更新树模型
-        self._update_tree_models(X, y)
+        # 树模型更新
+        self._update_tree_models(X, np.argmax(y, axis=1))
+
+    def _update_tree_models(self, X, y):
+        """树模型增量学习"""
+        # XGBoost
+        if hasattr(self.stage_models['preflop'], 'partial_fit'):
+            self.stage_models['preflop'].partial_fit(
+                X, y,
+                classes=[0,1,2],
+                sample_weight=np.linspace(0.5, 1.0, len(X))  # 最近样本权重更高
+            )
+        
+        # GBDT
+        self.stage_models['flop'].n_estimators += 10
+        self.stage_models['flop'].fit(X, y)
 
     def _execute_action(self, game_state, action):
         """执行动作并返回新状态"""
@@ -1092,17 +1255,6 @@ class HybridPokerAI:
         else:
             return self.stage_models[stage].predict_proba([features])[0]
         
-    def _update_tree_models(self, X, y):
-        """更新XGBoost/GBDT模型"""
-        # 转换标签
-        y_labels = np.argmax(y, axis=1)
-        
-        # 更新preflop模型
-        if hasattr(self.stage_models['preflop'], 'partial_fit'):
-            self.stage_models['preflop'].partial_fit(X, y_labels, classes=[0,1,2])
-        
-        # 更新flop模型
-        self.stage_models['flop'].fit(X, y_labels)
 
     def update_equity(self, game_state, force_update=False):
         """
