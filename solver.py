@@ -634,7 +634,7 @@ class HybridPokerAI:
             features = self._preprocess_postflop(raw_features, context)
 
         # 确保特征维度符合模型要求
-        features = np.array(features)
+        features = np.array(list(features))
         expected_features = NUM_FEATURES  # 模型期望的特征数量
         if features.ndim > 2:
             features = features.squeeze()  # 去掉多余维度
@@ -1244,30 +1244,3 @@ if __name__ == "__main__":
     print("\n推荐决策：")
     for action in decision:
         print(f"- {action}")
-
-
-
-
-
-    # # 查看在线学习效果
-    # test_state = simulate_game_state()
-    # print("初始决策:", poker_ai.decide_action(test_state))
-
-    # # 运行1000局学习
-    # for _ in range(1000):
-    #     run_full_episode(poker_ai)
-
-    # print("训练后决策:", poker_ai.decide_action(test_state))
-
-
-
-    # poker_ai = HybridPokerAI()
-    # game_state = simulate_game_state()
-    # decision = poker_ai.decide_action(game_state)
-    # print("当前牌局状态：")
-    # print(f"手牌: {[Card.int_to_str(c) for c in game_state['hero_hand']]}")
-    # print(f"公共牌: {[Card.int_to_str(c) for c in game_state['community']]}")
-    # print(f"位置: {game_state['position']}")
-    # print("\n推荐决策：")
-    # for action in decision:
-    #     print(f"- {action}")
