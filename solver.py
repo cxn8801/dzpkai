@@ -623,6 +623,7 @@ class HybridPokerAI:
         if 'big_blind' not in game_state:
             game_state['big_blind'] = BB  # 默认 1BB
         
+        # 提取特征
         raw_features = self.extract_features(game_state)
 
         # 提取阶段特异性特征
@@ -630,47 +631,48 @@ class HybridPokerAI:
         if stage == 'preflop':
             features = self._preprocess_preflop(raw_features)
         else:
-            context = self.context_model(torch.Tensor(raw_features['context']))
+            context = self.context_model(torch.tensor(raw_features['context'], dtype=torch.float32))
             features = self._preprocess_postflop(raw_features, context)
 
-        # 确保特征维度符合模型要求
-        features = np.array(list(features))
-        expected_features = NUM_FEATURES  # 模型期望的特征数量
-        if features.ndim > 2:
-            features = features.squeeze()  # 去掉多余维度
-        if features.shape[0] < expected_features:
-            # 如果特征数量不足，填充 0
-            features = np.pad(features, (0, expected_features - features.shape[0]), mode='constant')
-        elif features.shape[0] > expected_features:
-            # 如果特征数量过多，截断
-            features = features[:expected_features]
+        # 检查 features 是否为 torch.Tensor，如果是则转换为 NumPy 数组
+        if isinstance(features, torch.Tensor):
+            features = features.detach().cpu().numpy()  # 确保从 GPU 转移到 CPU
 
-        # 修改特征处理部分
+        # 确保特征维度符合模型要求
+        features = np.array(features)
+        expected_features = NUM_FEATURES  # 模型期望的特征数量
+
+        # 统一处理特征维度
+        if features.ndim == 1:
+            features = features.reshape(1, -1)  # 确保二维
+        elif features.ndim > 2:
+            features = features.squeeze()  # 移除多余维度
+
+        # 填充或裁剪特征，使其符合预期长度
+        if features.shape[1] < expected_features:
+            features = np.pad(features, ((0, 0), (0, expected_features - features.shape[1])), mode='constant')
+        elif features.shape[1] > expected_features:
+            features = features[:, :expected_features]
+
+        # 根据阶段选择模型进行预测
         if stage in ['turn', 'river']:
             with torch.no_grad():
                 logits, _ = self.stage_models[stage](
-                    torch.tensor(features).unsqueeze(0), 
-                    torch.tensor([[STAGES.index(stage)]])
+                    torch.tensor(features, dtype=torch.float32), 
+                    torch.tensor([[STAGES.index(stage)]], dtype=torch.long)
                 )
-                probs = torch.softmax(logits, dim=-1).numpy()
+                probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]  # 转换为 NumPy 数组
         else:
-            # 新增维度修正
-            if features.ndim == 3:
-                features = features.squeeze(0)  # 将三维降为二维
-            elif features.ndim == 1:
-                features = features.reshape(1, -1)  # 确保二维
-                
-            # 添加特征校验
-            if features.shape[1] != NUM_FEATURES:
-                features = features[:, :NUM_FEATURES]  # 截断多余特征
-                
-            probs = self.stage_models[stage].predict_proba(features)[0]  # 移除多余列表包装
+            probs = self.stage_models[stage].predict_proba(features)[0]  # 获取预测概率
 
+        # 获取对手风格信息并融合策略
         opp_profile = self.opponent_model.predict(game_state)
         final_probs = self._blend_strategies(probs, game_state, opp_profile)
+
+        # 记录决策
         self._record_decision(game_state, final_probs)
-        self._record_decision(game_state, final_probs)
-        print("决策记录已生成")  # 调试日志
+
+        # 格式化并返回决策
         return self.format_decision(final_probs, game_state)
 
     def _preprocess_preflop(self, raw_features):
