@@ -39,25 +39,6 @@ def create_card(card_str):
     """字符串转treys Card对象"""
     return Card.new(card_str)
 
-def simulate_game_state():
-    """完全使用BB单位的游戏状态"""
-    return {
-        'player_id': 5,
-        'hero_hand': [create_card('Ah'), create_card('Kd')],
-        'community': [create_card('Qs'), create_card('Jh'), create_card('Tc')],
-        'street': 'flop',
-        'position': 'BTN',
-        'current_pot': 5.0,       # BB单位
-        'previous_actions': [
-            {'action': 'raise', 'bet_size': 0.83},  # BB单位
-            {'action': 'call', 'bet_size': 0.33}    # BB单位
-        ],
-        'stack': 16.67,          # BB单位
-        'to_call': 0.33,         # BB单位
-        'big_blind': BB,         # 固定1BB
-        'small_blind': SB        # 固定0.5BB
-    }
-
 # ====================== Range与牌力模块 ======================
 class RangeManager:
     """手牌范围管理（预计算Top手牌）"""
@@ -395,44 +376,46 @@ class HybridPokerAI:
         # 并发控制（如果使用多线程）
         self.cache_lock = Lock()
 
+    # ====================== 增强版元学习器训练 ======================
     def _train_meta_learner(self):
-        """
-        训练元学习器
-        所有涉及金额的特征（如stack, pot, bet_size等）均为BB单位
-        """
+        """带默认初始化的元学习器训练"""
         historical_data = self._load_decision_history()
+        
+        # 初始化默认权重
+        self.meta_learner.coef_ = np.array([
+            # 上下文特征权重 (7个特征)
+            [0.3, 0.2, 0.1, 0.15, 0.15, 0.05, 0.05],   # fold
+            [0.2, 0.25, 0.2, 0.15, 0.1, 0.05, 0.05],   # call
+            [0.25, 0.15, 0.15, 0.2, 0.15, 0.05, 0.05]  # raise
+        ])
+        self.meta_learner.intercept_ = np.array([0.1, 0.1, 0.1])
+        
         if not historical_data:
-            print("无有效历史记录，跳过元学习器训练")
+            print("使用默认元学习权重")
             return
 
         X = []
         y = []
         for d in historical_data:
-            # 兼容新版和旧版特征结构，所有金额相关字段都以BB单位存储
             features = d.get('features', [])
             if isinstance(features, dict):
-                # context和stage_features都应为BB单位
                 features = features.get('context', []) + features.get('stage_features', [])
-            
-            # 假如历史数据有chip为单位的，需要这里转换为BB单位
-            # 例如：features[i] = features[i] / BB_chip_value  # 视具体特征定义而定
-            # 若已统一为BB则无需处理
-
             if len(features) >= NUM_FEATURES:
-                X.append(features[:NUM_FEATURES])  # 截断多余特征，全部为BB
-                weights = d.get('weights', [0.33, 0.34, 0.33])
-                y.append(weights)
-
+                X.append(features[:NUM_FEATURES])
+                weights = d.get('decision', {'fold':0.33, 'call':0.34, 'raise':0.33})
+                y.append([weights['fold'], weights['call'], weights['raise']])
+        
         if len(X) < 10:
-            print(f"有效样本不足 ({len(X)})，跳过训练")
+            print(f"样本不足 ({len(X)}), 保持默认权重")
             return
-
+        
         X = np.array(X)
         y = np.array(y)
-
-        # 明确所有X中金额特征为BB单位（如stack、pot、bet_size等）
+        
+        # 添加L2正则化防止过拟合
+        self.meta_learner = Ridge(alpha=0.5)
         self.meta_learner.fit(X, y)
-        print("元学习器训练完成，特征维度:", X.shape, "（金额全部为BB单位）")
+        print("元学习器训练完成，特征维度:", X.shape)
 
     def _load_decision_history(self):
         historical_data = []
@@ -628,20 +611,33 @@ class HybridPokerAI:
 
         return actions
 
+    # ====================== 修改后的模型加载方法 ======================
     def _init_pytorch_model(self, stage):
+        """修复版PyTorch模型初始化"""
+        input_size = 32 if stage == 'turn' else 48
         model = StageLSTM(
-            input_size=32 if stage == 'turn' else 48,
+            input_size=input_size,
             hidden_size=64,
             num_classes=3
         )
         model_path = f'{self.model_path}{stage}_model.pth'
-        if os.path.exists(model_path):
-            try:
-                model.load_state_dict(torch.load(model_path))
-            except Exception as e:
-                print(f"加载{stage}模型失败: {e}，使用初始权重")
-        else:
-            print(f"未找到{stage}模型文件，使用初始权重")
+        
+        try:
+            # 加载完整模型结构（包含stage_emb层）
+            model = torch.load(model_path)
+            model.eval()
+            print(f"✅ {stage}模型加载成功")
+            # 验证前向传播
+            test_input = torch.randn(1, 1, input_size)  # 添加序列维度
+            stage_idx = torch.tensor([[STAGES.index(stage)]], dtype=torch.long)
+            _ = model(test_input, stage_idx)
+        except Exception as e:
+            print(f"❌ {stage}模型加载失败: {str(e)}")
+            # 应急初始化时补全必要参数
+            model.stage_emb = nn.Embedding(4, 4)
+            model.linear_adapter = nn.Linear(input_size + 4, 32)
+            print(f"⚠️ 应急{stage}模型已启用")
+        
         return model
 
     def _load_model_weights(self):
@@ -749,64 +745,157 @@ class HybridPokerAI:
                 pass
 
     def decide_action(self, game_state):
-        # 短码全押特殊处理（优先判断）
-        if game_state['stack'] <= 2.0:  # ≤2BB时强制全押
-            return ['0% fold', '0% check', '100% all-in'] 
+        """完整修复版决策方法"""
+        # 极端情况处理：短码全押
+        if game_state.get('stack', 0) <= 2.0:  # ≤2BB时强制全押
+            return ['0% fold', '0% check', '100% all-in']
         
-        if 'big_blind' not in game_state:
-            game_state['big_blind'] = BB  # 默认 1BB
-        
-        # 提取特征
-        raw_features = self.extract_features(game_state)
+        # 状态初始化
+        try:
+            bb = float(game_state.get('big_blind', BB))  # 确保转换为浮点数
+            game_state.setdefault('previous_actions', [])
+            game_state.setdefault('street', 'preflop')
+        except (TypeError, ValueError) as e:
+            print(f"状态初始化错误: {str(e)}, 使用默认值")
+            bb = BB
+            game_state['street'] = 'preflop'
 
-        # 提取阶段特异性特征
+        # 特征提取（带异常保护）
+        try:
+            raw_features = self.extract_features(game_state)
+            context_features = raw_features['context']
+            stage_features = raw_features['stage_features']
+        except KeyError as e:
+            print(f"特征提取关键字段缺失: {str(e)}, 使用安全特征")
+            context_features = np.zeros(7)
+            stage_features = np.zeros(NUM_FEATURES-7)
+
+        # 阶段识别
         stage = game_state['street']
-        if stage == 'preflop':
-            features = self._preprocess_preflop(raw_features)
-        else:
-            context = self.context_model(torch.tensor(raw_features['context'], dtype=torch.float32))
-            features = self._preprocess_postflop(raw_features, context)
+        if stage not in STAGES:
+            stage = 'preflop'
 
-        # 检查 features 是否为 torch.Tensor，如果是则转换为 NumPy 数组
-        if isinstance(features, torch.Tensor):
-            features = features.detach().cpu().numpy()  # 确保从 GPU 转移到 CPU
+        # 特征统一处理
+        full_features = np.concatenate([context_features, stage_features])
+        full_features = full_features.astype(np.float32)
 
-        # 确保特征维度符合模型要求
-        features = np.array(features)
-        expected_features = NUM_FEATURES  # 模型期望的特征数量
+        # 阶段特异性预测
+        probs = None
+        try:
+            if stage in ['turn', 'river']:
+                # PyTorch模型处理
+                with torch.no_grad():
+                    # 确保输入维度正确 (batch_size=1, seq_len=1, features)
+                    features_tensor = torch.tensor(
+                        full_features, 
+                        dtype=torch.float32
+                    ).unsqueeze(0).unsqueeze(0)  # shape: (1,1,15)
+                    
+                    # 生成阶段索引
+                    stage_idx = torch.tensor(
+                        [[STAGES.index(stage)]], 
+                        dtype=torch.long
+                    )
+                    
+                    # 模型前向传播
+                    logits, _ = self.stage_models[stage](
+                        features_tensor, 
+                        stage_idx
+                    )
+                    probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]
+            else:
+                # 传统机器学习模型处理
+                features = full_features.reshape(1, -1)
+                
+                # 特征维度修正
+                if features.shape[1] < NUM_FEATURES:
+                    # 填充零值
+                    features = np.pad(
+                        features,
+                        ((0,0), (0, NUM_FEATURES - features.shape[1])),
+                        mode='constant'
+                    )
+                elif features.shape[1] > NUM_FEATURES:
+                    # 截断多余特征
+                    features = features[:, :NUM_FEATURES]
+                
+                # 预测概率
+                if hasattr(self.stage_models[stage], 'predict_proba'):
+                    probs = self.stage_models[stage].predict_proba(features)[0]
+                else:
+                    # 应急处理（神经网络模型意外出现在传统阶段）
+                    with torch.no_grad():
+                        features_tensor = torch.tensor(
+                            features, 
+                            dtype=torch.float32
+                        ).unsqueeze(1)  # 添加序列维度
+                        stage_idx = torch.tensor(
+                            [[STAGES.index(stage)]], 
+                            dtype=torch.long
+                        )
+                        logits, _ = self.stage_models[stage](
+                            features_tensor, 
+                            stage_idx
+                        )
+                        probs = torch.softmax(logits, dim=-1).numpy()[0]
+        except Exception as e:
+            print(f"模型预测异常: {str(e)}, 使用安全概率")
+            probs = np.array([0.33, 0.34, 0.33])
 
-        # 统一处理特征维度
-        if features.ndim == 1:
-            features = features.reshape(1, -1)  # 确保二维
-        elif features.ndim > 2:
-            features = features.squeeze()  # 移除多余维度
+        # 概率合法性校验
+        probs = np.clip(probs, 0.0, 1.0)
+        if np.sum(probs) == 0:
+            probs = np.array([0.33, 0.34, 0.33])
+        probs /= np.sum(probs)  # 确保概率归一化
 
-        # 填充或裁剪特征，使其符合预期长度
-        if features.shape[1] < expected_features:
-            features = np.pad(features, ((0, 0), (0, expected_features - features.shape[1])), mode='constant')
-        elif features.shape[1] > expected_features:
-            features = features[:, :expected_features]
+        # 获取对手画像
+        try:
+            opp_profile = self.opponent_model.predict(game_state)
+        except Exception as e:
+            print(f"对手建模异常: {str(e)}, 使用默认画像")
+            opp_profile = {
+                "style": "unknown",
+                "fold": 0.33, 
+                "call": 0.34, 
+                "raise": 0.33
+            }
 
-        # 根据阶段选择模型进行预测
-        if stage in ['turn', 'river']:
-            with torch.no_grad():
-                logits, _ = self.stage_models[stage](
-                    torch.tensor(features, dtype=torch.float32), 
-                    torch.tensor([[STAGES.index(stage)]], dtype=torch.long)
-                )
-                probs = torch.softmax(logits, dim=-1).cpu().numpy()[0]  # 转换为 NumPy 数组
-        else:
-            probs = self.stage_models[stage].predict_proba(features)[0]  # 获取预测概率
+        # 策略融合
+        try:
+            blended_probs = self._blend_strategies(
+                probs, 
+                game_state, 
+                opp_profile
+            )
+        except Exception as e:
+            print(f"策略融合异常: {str(e)}, 使用原始概率")
+            blended_probs = {
+                'fold': probs[0],
+                'call': probs[1],
+                'raise': probs[2]
+            }
 
-        # 获取对手风格信息并融合策略
-        opp_profile = self.opponent_model.predict(game_state)
-        final_probs = self._blend_strategies(probs, game_state, opp_profile)
+        # 记录决策（带异常保护）
+        try:
+            self._record_decision(game_state, blended_probs)
+        except Exception as e:
+            print(f"决策记录失败: {str(e)}")
 
-        # 记录决策
-        self._record_decision(game_state, final_probs)
+        # 格式化输出（带单位转换保护）
+        try:
+            formatted_decision = self.format_decision(
+                blended_probs, 
+                game_state
+            )
+        except Exception as e:
+            print(f"格式化异常: {str(e)}, 使用默认格式")
+            formatted_decision = [
+                "33.3% fold",
+                "33.3% call", 
+                "33.3% raise"
+            ]
 
-        # 格式化并返回决策
-        return self.format_decision(final_probs, game_state)
+        return formatted_decision
 
     def _preprocess_preflop(self, raw_features):
         features = np.array(raw_features['context'] + raw_features['stage_features'])
@@ -1387,6 +1476,25 @@ class RewardNormalizer:
 
 
 # ====================== 演示主流程 ======================
+def simulate_game_state():
+    """完全使用BB单位的游戏状态"""
+    return {
+        'player_id': 5,
+        'hero_hand': [create_card('Ah'), create_card('Kd')],
+        'community': [create_card('Qs'), create_card('Jh'), create_card('Tc')],
+        'street': 'flop',
+        'position': 'BTN',
+        'current_pot': 5.0,       # BB单位
+        'previous_actions': [
+            {'action': 'raise', 'bet_size': 0.83},  # BB单位
+            {'action': 'call', 'bet_size': 0.33}    # BB单位
+        ],
+        'stack': 16.67,          # BB单位
+        'to_call': 0.33,         # BB单位
+        'big_blind': BB,         # 固定1BB
+        'small_blind': SB        # 固定0.5BB
+    }
+
 if __name__ == "__main__":
     poker_ai = HybridPokerAI()
     game_state = simulate_game_state()
