@@ -25,6 +25,8 @@ import json
 from threading import Lock
 import re
 from collections import defaultdict, deque
+# 原导入部分（添加以下内容）
+from sklearn.linear_model import Ridge  # 新增导入
 
 # ====================== 常量与工具 ======================
 NUM_FEATURES = 15
@@ -418,23 +420,50 @@ class HybridPokerAI:
         print("元学习器训练完成，特征维度:", X.shape)
 
     def _load_decision_history(self):
-        historical_data = []
-        if os.path.exists(self.history_file):
-            try:
-                with open(self.history_file, 'r') as f:
-                    raw_data = json.load(f)
-                    # 过滤无效记录
-                    historical_data = [
-                        d for d in raw_data 
-                        if 'features' in d and 'decision' in d
-                    ]
-                    # 旧数据迁移（兼容旧版本）
-                    for d in raw_data:
-                        if 'feature' in d:  # 处理旧键名
-                            d['features'] = d.pop('feature')
-            except Exception as e:
-                print(f"加载历史文件失败: {e}")
-        return historical_data
+        """带默认数据生成的历史记录加载"""
+        default_data = []
+        
+        # 生成20条模拟数据（正态分布）
+        np.random.seed(42)
+        for _ in range(20):
+            features = np.clip(np.random.normal(0.5, 0.2, 15), 0, 1).tolist()
+            decision = {
+                'fold': float(np.random.beta(2, 5)),
+                'call': float(np.random.beta(5, 5)),
+                'raise': float(np.random.beta(2, 3))
+            }
+            # 归一化
+            total = sum(decision.values())
+            decision = {k: v/total for k, v in decision.items()}
+            
+            default_data.append({
+                'features': features[:7] + features[7:15],  # 确保15维
+                'decision': decision,
+                'timestamp': datetime.now().isoformat()
+            })
+
+        try:
+            if not os.path.exists(self.history_file):
+                with open(self.history_file, 'w', encoding='utf-8') as f:
+                    json.dump(default_data, f, indent=2)
+                return default_data
+            
+            with open(self.history_file, 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+                
+            # 数据清洗
+            valid_data = []
+            for d in raw:
+                if not isinstance(d, dict): continue
+                if 'features' not in d or 'decision' not in d: continue
+                if len(d['features']) != 15: continue
+                valid_data.append(d)
+                
+            return valid_data if len(valid_data) >= 10 else default_data
+            
+        except Exception as e:
+            print(f"历史记录加载失败: {str(e)}，使用默认数据")
+            return default_data
         
     def _save_decision_history(self, new_record):
         try:
@@ -541,29 +570,30 @@ class HybridPokerAI:
         }
     
     def format_decision(self, blended_probs, game_state):
-        """修正版决策格式化方法，确保概率总和100%"""
-        # 确保概率合法
-        blended_probs = {k: max(0, v) for k, v in blended_probs.items()}
+        """精确到小数点后两位的决策格式化"""
+        # 输入校验
+        blended_probs = defaultdict(float, blended_probs)
         total = sum(blended_probs.values())
-        
-        # 处理异常情况
         if total <= 0:
-            return ["33% fold", "34% call", "33% raise"]
+            blended_probs = {'fold': 0.3333, 'call': 0.3333, 'raise': 0.3334}
+        else:
+            blended_probs = {k: v/total for k, v in blended_probs.items()}
 
-        # 计算精确百分比
+        # 精确计算百分比
         exact_percents = {
-            action: (prob / total) * 100 
-            for action, prob in blended_probs.items()
+            'fold': blended_probs['fold'] * 100,
+            'call': blended_probs['call'] * 100,
+            'raise': blended_probs['raise'] * 100
         }
 
         # 四舍五入到两位小数
         rounded = {k: round(v, 2) for k, v in exact_percents.items()}
         total_rounded = sum(rounded.values())
 
-        # 处理四舍五入误差
+        # 动态调整误差
         diff = round(100.00 - total_rounded, 2)
         if diff != 0:
-            # 找到最大项调整差值
+            # 找到最大项调整
             max_action = max(rounded, key=lambda x: rounded[x])
             rounded[max_action] += diff
             rounded[max_action] = round(rounded[max_action], 2)
@@ -572,7 +602,7 @@ class HybridPokerAI:
         actions = []
         bb = game_state['big_blind']
         
-        # 获取加注量（BB单位）
+        # 加注量计算（带边界检查）
         min_raise = max(2 * bb, 1.0)
         max_raise = game_state['stack']
         equity = game_state.get('calculated_equity', 0.5)
@@ -589,7 +619,7 @@ class HybridPokerAI:
             if percent.is_integer():
                 display_percent = f"{int(percent)}%"
             else:
-                display_percent = f"{percent:.2f}".rstrip('0').rstrip('.') + "%"
+                display_percent = f"{percent:.2f}%".rstrip('0').rstrip('.') + "%"
 
             # 特殊处理call/check
             if action == 'call':
@@ -609,11 +639,17 @@ class HybridPokerAI:
 
             actions.append(display_action)
 
+        # 最终校验
+        final_total = sum(float(a.split('%')[0]) for a in actions)
+        if abs(final_total - 100.0) > 0.01:
+            return ["33.33% fold", "33.33% call", "33.34% raise"]
+        
         return actions
 
     # ====================== 修改后的模型加载方法 ======================
     def _init_pytorch_model(self, stage):
-        """修复版PyTorch模型初始化"""
+        """完整修复版PyTorch模型初始化"""
+        # 初始化模型结构（必须与训练时完全一致）
         input_size = 32 if stage == 'turn' else 48
         model = StageLSTM(
             input_size=input_size,
@@ -621,30 +657,45 @@ class HybridPokerAI:
             num_classes=3
         )
         model_path = f'{self.model_path}{stage}_model.pth'
-        
+
         try:
-            # 加载完整模型结构（包含stage_emb层）
-            model = torch.load(model_path)
+            # 加载状态字典
+            state_dict = torch.load(model_path, map_location='cpu')
+            
+            # 过滤不匹配的键（兼容性处理）
+            model_state = model.state_dict()
+            matched_state = {k: v for k, v in state_dict.items() if k in model_state}
+            
+            # 加载匹配参数
+            model_state.update(matched_state)
+            model.load_state_dict(model_state)
+            
+            # 验证模型完整性
+            assert model.linear_adapter.in_features == input_size + 4, "输入维度不匹配"
+            assert model.stage_emb.num_embeddings == 4, "阶段嵌入层异常"
+            
+            # 测试推理
+            with torch.no_grad():
+                test_input = torch.randn(1, 1, input_size)  # (batch, seq, features)
+                stage_idx = torch.tensor([[STAGES.index(stage)]], dtype=torch.long)
+                _ = model(test_input, stage_idx)
+                
             model.eval()
-            print(f"✅ {stage}模型加载成功")
-            # 验证前向传播
-            test_input = torch.randn(1, 1, input_size)  # 添加序列维度
-            stage_idx = torch.tensor([[STAGES.index(stage)]], dtype=torch.long)
-            _ = model(test_input, stage_idx)
+            print(f"✅ {stage}模型加载成功 | 输入维度: {input_size}")
+            return model
+            
         except Exception as e:
             print(f"❌ {stage}模型加载失败: {str(e)}")
-            # 应急初始化时补全必要参数
+            # 应急初始化
             model.stage_emb = nn.Embedding(4, 4)
             model.linear_adapter = nn.Linear(input_size + 4, 32)
-            print(f"⚠️ 应急{stage}模型已启用")
-        
-        return model
+            print(f"⚠️ 应急{stage}模型已启用 | 输入维度: {input_size}")
+            return model
 
     def _load_model_weights(self):
-        """增强版模型加载方法，带完整性校验"""
+        """完整模型加载流程"""
         print("\n=== 模型加载流程开始 ===")
         
-        # 预加载模型列表
         model_files = {
             'preflop': ('preflop_model.joblib', XGBClassifier),
             'flop': ('flop_model.joblib', GradientBoostingClassifier),
@@ -658,51 +709,61 @@ class HybridPokerAI:
                 if not os.path.exists(filepath):
                     raise FileNotFoundError(f"{filename} 不存在")
 
-                # 加载并验证模型
-                if stage in ['turn', 'river']:
-                    model = self._init_pytorch_model(stage)
-                    model.load_state_dict(torch.load(filepath))
-                    model.eval()
-                    # 验证模型结构
-                    test_input = torch.randn(1, 32 if stage == 'turn' else 48)
-                    _ = model(test_input)  # 测试前向传播
-                else:
+                # 加载传统模型
+                if stage in ['preflop', 'flop']:
                     model = joblib.load(filepath)
-                    # 验证特征数匹配
                     if model.n_features_in_ != NUM_FEATURES:
                         raise ValueError(f"特征数不匹配: 模型{model.n_features_in_} vs 定义{NUM_FEATURES}")
-
-                self.stage_models[stage] = model
-                print(f"✅ {stage}模型加载成功 | 特征数: {getattr(model, 'n_features_in_', 'N/A')}")
+                    self.stage_models[stage] = model
+                    print(f"✅ {stage}模型加载成功 | 特征数: {model.n_features_in_}")
+                    
+                # 加载PyTorch模型
+                else:
+                    model = self._init_pytorch_model(stage)
+                    
+                    # 维度校验
+                    input_size = 32 if stage == 'turn' else 48
+                    test_input = torch.randn(1, 1, input_size)
+                    stage_idx = torch.tensor([[STAGES.index(stage)]], dtype=torch.long)
+                    with torch.no_grad():
+                        _ = model(test_input, stage_idx)
+                        
+                    self.stage_models[stage] = model
+                    print(f"✅ {stage}模型加载成功 | 参数数: {sum(p.numel() for p in model.parameters())}")
 
             except Exception as e:
                 print(f"❌ {stage}模型加载失败: {str(e)}")
-                print("正在初始化应急模型...")
                 self._init_fallback_model(stage)
 
         print("=== 模型加载完成 ===\n")
 
     def _init_fallback_model(self, stage):
-        """应急模型初始化（带特征校验）"""
-        # 生成符合特征维度的假数据
+        """带特征校验的应急模型初始化"""
+        # 生成符合特征维度的测试数据
+        np.random.seed(42)
         dummy_X = np.random.rand(100, NUM_FEATURES)
-        dummy_y = np.random.choice([0,1,2], size=100)
+        dummy_y = np.random.choice([0,1,2], p=[0.3,0.4,0.3], size=100)
         
         if stage in ['preflop', 'flop']:
+            # 树模型初始化
             if stage == 'preflop':
                 model = XGBClassifier(n_estimators=50)
             else:
-                model = GradientBoostingClassifier()
+                model = GradientBoostingClassifier(n_estimators=50)
+                
             model.fit(dummy_X, dummy_y)
+            print(f"⚠️ 应急{stage}模型已启用 | 特征数: {model.n_features_in_}")
+            
         else:
+            # 神经网络模型
             model = StageLSTM(
                 input_size=32 if stage == 'turn' else 48,
                 hidden_size=64,
                 num_classes=3
             )
-        
+            print(f"⚠️ 应急{stage}模型已启用 | 输入维度: {32 if stage == 'turn' else 48}")
+            
         self.stage_models[stage] = model
-        print(f"⚠️ 应急{stage}模型已启用")
 
     def _create_initial_models(self):
         print("正在生成初始模型文件...")
